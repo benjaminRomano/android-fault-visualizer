@@ -2,9 +2,9 @@
 
 The following directory contains all the artifacts needed to visualize page faults for Firefox app startup.
 
-Below are screenshots demonstrating how to validate that `libxul.so` is compiled such that code is read from disk sequentially.
+**Note:** To explore this data using the `visualizations.ipynb` notebook, copy the files into root directory.
 
-The following directory contains example page faults from Firefox startup.
+Below are screenshots demonstrating how to validate that `libxul.so` is compiled such that code is read from disk sequentially.
 
 ### Perfetto Trace
 
