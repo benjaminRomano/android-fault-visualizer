@@ -86,7 +86,7 @@ for map_entry in map_entries:
         })
 
 with open('file_sizes.csv', 'w', newline='') as csvfile:
-    writer = csv.DictWriter(csvfile, fieldnames=['file_name', 'zip_entry_name', 'size'])
+    writer = csv.DictWriter(csvfile, fieldnames=['file_name', 'zip_entry_name', 'size', 'file_offset'])
     writer.writeheader()
     for file_path, zip_entries in pulled_zips.items():
         # Write zip entries
@@ -95,6 +95,7 @@ with open('file_sizes.csv', 'w', newline='') as csvfile:
                 'file_name': file_path,
                 'zip_entry_name': zip_entry['file_name'],
                 'size': zip_entry['size'],
+                'file_offset': zip_entry['offset']
             })
 
     seen_files = set()
@@ -107,7 +108,8 @@ with open('file_sizes.csv', 'w', newline='') as csvfile:
         writer.writerow({
             'file_name': map_entry['file_name'],
             'zip_entry_name': None,
-            'size': file_size
+            'size': file_size,
+            'file_offset': 0
         })
 
 page_fault_mappings = []
