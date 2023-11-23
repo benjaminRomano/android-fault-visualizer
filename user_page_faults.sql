@@ -1,5 +1,7 @@
+-- Load Android Startup module to be able to filter page faults to app startup
 INCLUDE PERFETTO MODULE android.startup.startups;
 
+-- Extract page_fault_user ftrace events for a given package
 SELECT 
   ftrace_event.ts,
   process.name as process_name, 
@@ -13,5 +15,5 @@ WHERE
   ftrace_event.name = 'page_fault_user' 
   AND ftrace_event.ts >= (SELECT MIN(ts) from android_startups WHERE package = process.name)
   AND ftrace_event.ts <= (SELECT MIN(ts_end) from android_startups WHERE package = process.name)
-  AND process.name = 'com.google.android.youtube' 
+  AND process.name = 'PROCESS_NAME' 
 ORDER BY ts ASC

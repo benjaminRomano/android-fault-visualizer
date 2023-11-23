@@ -5,6 +5,8 @@ import subprocess
 from typing import Optional
 from zipfile import ZipFile
 
+# This script is janky...
+
 
 def find_map_entry(map_entries, addr: int) -> Optional[any]:
     """
@@ -28,7 +30,7 @@ def find_zip_entry(zip_entries, offset: int) -> Optional[any]:
     return None
 
 
-# Read file
+# Read page faults
 user_page_fault_entries = []
 with open("user_page_faults.csv") as csv_file:
     # Skip empty line
@@ -70,11 +72,12 @@ with open("maps.txt") as file:
             }
         )
 
-pulled_zips = {}
+# Pull APKs to compute the offsets of files within
+pulled_apks = {}
 
 for map_entry in map_entries:
     file_path = map_entry["file_name"]
-    if file_path in pulled_zips or not file_path.endswith(".apk"):
+    if file_path in pulled_apks or not file_path.endswith(".apk"):
         continue
 
     file_name = os.path.basename(file_path)
@@ -82,12 +85,13 @@ for map_entry in map_entries:
     subprocess.run(
         f"adb pull {file_path} {os.path.join('artifacts', file_name)}",
         shell=True,
+        check=True,
         stdout=subprocess.DEVNULL,
     )
-    pulled_zips[file_path] = []
+    pulled_apks[file_path] = []
     zf = ZipFile(os.path.join("artifacts", file_name))
     for zinfo in zf.infolist():
-        pulled_zips[file_path].append(
+        pulled_apks[file_path].append(
             {
                 "file_name": zinfo.filename,
                 "offset": int(zinfo.header_offset),
@@ -95,12 +99,13 @@ for map_entry in map_entries:
             }
         )
 
+# Report the file sizes and APK entry sizes in a csv file
 with open("file_sizes.csv", "w", newline="") as csvfile:
     writer = csv.DictWriter(
         csvfile, fieldnames=["file_name", "zip_entry_name", "size", "file_offset"]
     )
     writer.writeheader()
-    for file_path, zip_entries in pulled_zips.items():
+    for file_path, zip_entries in pulled_apks.items():
         # Write zip entries
         for zip_entry in zip_entries:
             writer.writerow(
@@ -113,11 +118,19 @@ with open("file_sizes.csv", "w", newline="") as csvfile:
             )
 
     seen_files = set()
+    # To speed up processing only compute file sizes  files related to application code
     for map_entry in map_entries:
         file_name = map_entry["file_name"]
-        if file_name not in seen_files or not any(
-            extension in file_name
-            for extension in [".so", ".vdex", ".apk", ".odex", ".oat", ".art"]
+        if (
+            file_name in seen_files
+            or not any(
+                file_name.endswith(extension)
+                for extension in [".so", ".vdex", ".apk", ".odex", ".oat", ".art"]
+            )
+            or any(
+                file_name.startswith(prefix)
+                for prefix in ["/system/", "/apex/", "/vendor/"]
+            )
         ):
             continue
         seen_files.add(file_name)
@@ -125,10 +138,11 @@ with open("file_sizes.csv", "w", newline="") as csvfile:
             subprocess.run(
                 f"adb shell wc {map_entry['file_name']}",
                 shell=True,
+                check=True,
                 stdout=subprocess.PIPE,
             )
             .stdout.decode("utf-8")
-            .split(" ")[3]
+            .split(" ")[2]
         )
         writer.writerow(
             {
@@ -153,8 +167,8 @@ for user_page_fault in user_page_fault_entries:
     file_name = map_entry["file_name"]
 
     zip_entry = None
-    if file_name in pulled_zips:
-        zip_entry = find_zip_entry(pulled_zips[file_name], file_offset)
+    if file_name in pulled_apks:
+        zip_entry = find_zip_entry(pulled_apks[file_name], file_offset)
 
     page_fault_mappings.append(
         {
