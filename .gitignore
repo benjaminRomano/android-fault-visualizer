@@ -299,11 +299,8 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python,pycharm,jupyternotebooks
 
-artifacts/
-traces/
-/user_page_faults.csv
-/mapped_faults.csv
-/file_sizes.csv
-/maps.txt
 record_android_trace
 trace_processor
+/output
+
+.DS_Store

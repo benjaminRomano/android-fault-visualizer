@@ -5,27 +5,30 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import math
+import os
 from ipywidgets import interact
 
 COLUMN_COUNT = 100
 PAGE_SIZE = 4096
 
 
-def load_mappings():
+def load_mappings(output_dir: str = "output"):
     """
     Load the Fault mapping (file_name, offset) and the File Sizes (File Name, file size) from the csv files
     """
     mapped_faults = []
-    with open("mapped_faults.csv") as csv_file:
+    with open(os.path.join(output_dir, "mapped_faults.csv")) as csv_file:
         for row in csv.DictReader(csv_file):
             row["zip_entry_name"] = (
                 row["zip_entry_name"] if row["zip_entry_name"] else None
             )
             row["offset"] = int(row["offset"])
+            row["ts"] = int(row["ts"])
+            row["is_major"] = row["is_major"] == "True"
             mapped_faults.append(row)
 
     file_sizes = []
-    with open("file_sizes.csv") as csv_file:
+    with open(os.path.join(output_dir, "file_sizes.csv")) as csv_file:
         for row in csv.DictReader(csv_file):
             row["size"] = int(row["size"])
             row["zip_entry_name"] = (
@@ -49,8 +52,7 @@ def extract_faults(
     maybe_file = [
         file
         for file in file_sizes
-        if file["file_name"] == file_name
-        and (not zip_entry_name or file["zip_entry_name"] == zip_entry_name)
+        if file["file_name"] == file_name and file["zip_entry_name"] == zip_entry_name
     ]
     if not maybe_file:
         print(f"No file found: {file_name} - {zip_entry_name}")
@@ -217,12 +219,36 @@ def fault_time_series(faults):
     This is useful for more concisely visualizing the page fault behaviors (e.g. random access or contiguous page faults)
     """
     indexed_faults = faults.copy().reset_index()
-    return (
+
+    min_ts = min(indexed_faults["ts"].to_list())
+
+    chart1 = (
         alt.Chart(indexed_faults)
+        .transform_calculate(
+            major_count="datum.is_major ? 1 : 0", relative_ts=f"datum.ts - {min_ts}"
+        )
         .mark_line()
         .encode(
-            x=alt.X("index:N", title="Fault Index", axis=alt.Axis(labels=False)),
-            y=alt.Y("offset:Q", title="File Offset"),
+            x=alt.X("relative_ts:Q", title="Time", axis=alt.Axis(labels=False)),
+            y=alt.Y("cumulative_major_faults:Q"),
+        )
+        .transform_window(cumulative_major_faults="sum(major_count)")
+        .properties(width=1600)
+    )
+
+    chart2 = (
+        alt.Chart(indexed_faults)
+        .transform_calculate(
+            page_number=f"datum.offset / 4096", relative_ts=f"datum.ts - {min_ts}"
+        )
+        .mark_point(filled=True)
+        .encode(
+            x=alt.X("relative_ts:Q", title="Time", axis=alt.Axis(labels=False)),
+            y=alt.Y("page_number:Q", title="Page Number"),
+            color=alt.Color("is_major:N"),
+            order=alt.Order("is_major:N", sort="ascending"),
         )
         .properties(width=1600)
     )
+
+    return alt.vconcat(chart1, chart2)

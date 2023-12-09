@@ -2,7 +2,7 @@
 
 The following directory contains all the artifacts needed to visualize page faults for Firefox app startup.
 
-**Note:** To explore this data using the `visualizations.ipynb` notebook, copy the files into root directory.
+**Note:** To explore this data using the `visualizations.ipynb` notebook, use `load_mappings(example)`.
 
 Below are screenshots demonstrating how to validate that `libxul.so` is compiled such that code is read from disk sequentially.
 

@@ -1,8 +1,7 @@
 # Android Fault Visualizer
 
 This repo contains scripts to perform analysis on an Android application's page fault behavior on app startup.
-
-**Note:** These scripts only work on x86 devices (i.e. emulators). See the caveats section for more details.
+This is useful for understanding whether profile-guided optimizations intended to improve code locality are impactful.
 
 Check out the [example directory](./example/README.md) to see how these scripts can be used to analyze Firefox's layout optimizations on their `.so` file.
 
@@ -36,7 +35,11 @@ pip install -r requirements.in
 ```bash
 # When prompted that the tracing session has started, manually open the app.
 # Once startup has completed, end the tracing session with `ctrl-C` to proceed.
-./trace.sh <package_name>
+./faults.py collect --package <package_name>
+
+# Process the page faults.
+# Optional: Use `--pull-apks` to get details about the file paged in from APK
+./faults.py process --package <package_name>
 ```
 
 ### Visualize
@@ -55,9 +58,3 @@ page_fault_chart("<file_name>", None, file_sizes, mapped_faults)
 # are read from a `.vdex` file.
 page_fault_chart("<apk file>", "<.so file>", file_sizes, mapped_faults)
 ```
-
-### Caveats
-
-The scripts provided currently only work on `x86` devices (i.e. emulators). This is becuase the scripts use the `exceptions:page_faults_user` ftrace event which is not available in linux kernel for `arm` arch. Presumably, this is due to differences in how virtual memory and faults are implemented in the different architectures.
-
-It may be possible to implement equivalent functionality for `arm` by instead tracing the `filemap:mm_filemap_add_to_page_cache` ftrace event. However, this will require a different mechanism to correlate page faults to files as this event returns an `inode` instead of the raw virtual memory address. With a slightly different mapping approach, it should be feasible to post-process the event to map it to a file name and a file relative offset.
