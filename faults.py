@@ -27,7 +27,7 @@ def find_map_entry(map_entries, addr: int) -> Optional[any]:
     Find the /proc/pid/map entry matching address
     """
     for map_entry in map_entries:
-        if addr >= map_entry["begin_address"] and addr <= map_entry["end_address"]:
+        if map_entry["begin_address"] <= addr <= map_entry["end_address"]:
             return map_entry
     return None
 
@@ -149,8 +149,6 @@ def dump_maps(package_name: str, output_dir: str):
 
 def dump_inodes(output_dir: str):
     print("Dumping inodes...")
-    if has_root():
-        raise Exception("Inode dumping on rooted devices not yet implemented")
 
     with open(os.path.join(output_dir, "inodes.txt"), "w") as f:
         f.write(
@@ -169,15 +167,9 @@ def dump_inodes(output_dir: str):
 
 def collect_trace(package_name: str, output_dir: str):
     subprocess.check_call(f"adb shell am force-stop {package_name}", shell=True)
-    if has_root():
-        subprocess.check_call(
-            "adb shell 'echo 3 > /proc/sys/vm/drop_caches'", shell=True
-        )
-    else:
-        subprocess.check_call(
-            "adb shell su -c '\"echo 3 > /proc/sys/vm/drop_caches\"'", shell=True
-        )
+    subprocess.check_call("adb shell su -c '\"echo 3 > /proc/sys/vm/drop_caches\"'", shell=True)
 
+    p = None
     try:
         p = subprocess.Popen(
             f"./record_android_trace -c ftrace.config -n -o {os.path.join(output_dir, 'faults.pftrace')} -tt",
@@ -188,8 +180,8 @@ def collect_trace(package_name: str, output_dir: str):
     except KeyboardInterrupt:
         pass
     finally:
-        p.wait()
-
+        if p:
+            p.wait()
 
 def get_arch() -> str:
     return subprocess.check_output(
@@ -206,7 +198,7 @@ def parse_maps(output_dir: str) -> List[Dict]:
     # 77593e689000-77593e693000: 77593e689000-77593e693000 r--p 00148000 07:30 14     /apex/com.android.runtime/bin/linker64
     with open(f"{output_dir}/maps.txt") as file:
         for line in file.readlines():
-            columns = re.split("\s{1,}", line.strip())
+            columns = re.split("\s+", line.strip())
 
             addr_space = columns[0]
             offset = columns[2]

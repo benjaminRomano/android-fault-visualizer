@@ -35,26 +35,18 @@ pip install -r requirements.in
 ```bash
 # When prompted that the tracing session has started, manually open the app.
 # Once startup has completed, end the tracing session with `ctrl-C` to proceed.
-./faults.py collect --package <package_name>
+# Optional: use `--output` to specify custom output directory.
+python ./faults.py collect --package <package_name>
 
 # Process the page faults.
 # Optional: Use `--pull-apks` to get details about the file paged in from APK
-./faults.py process --package <package_name>
+python ./faults.py process --package <package_name>
 ```
 
 ### Visualize
 
-The post-processed data can be explored using the `visualizations.ipynb` notebook.
+The post-processed data can be explored by running the `visualizations.ipynb` notebook.
 
-```python
-# Render graph of faulted pages for a given file
-# Tip: Use the generated `mapped_faults.csv` file to see what files were faulted in.
-page_fault_chart("<file_name>", None, file_sizes, mapped_faults)
+## Diffing
 
-# Render graph of faulted pages for a file within an APK
-# This is useful for when `.so` or `.dex` files are loaded directly from the APK.
-#
-# Note: Only in rare circumstances are DEX files loaded from the APK directly. More likely, the DEX files
-# are read from a `.vdex` file.
-page_fault_chart("<apk file>", "<.so file>", file_sizes, mapped_faults)
-```
+Results can be diffed by using the `compare.ipynb` notebook.
