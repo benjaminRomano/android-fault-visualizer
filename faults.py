@@ -2,9 +2,10 @@ import argparse
 import csv
 import os
 import re
+from typing import Optional, Tuple, List, Dict
+import time
 import shutil
 import subprocess
-from typing import Optional, Dict, List, Tuple
 from zipfile import ZipFile
 
 
@@ -137,6 +138,7 @@ def parse_add_to_page_cache(
 
 
 def dump_maps(package_name: str, output_dir: str):
+    print("Dumping maps...")
     pid = subprocess.check_output(
         f"adb shell pidof {package_name}", encoding="utf-8", shell=True
     ).strip()
@@ -158,30 +160,77 @@ def dump_inodes(output_dir: str):
                     "shell",
                     "su",
                     "-c",
-                    "find /apex /system /data /vendor -print0 \| xargs -0 stat -c '\"%d %i %n\"'",
+                    'find /apex /system /data /vendor -print0 \\| xargs -0 stat -c "%d %i %n"',
                 ],
                 encoding="utf-8",
             ).strip()
         )
 
 
-def collect_trace(package_name: str, output_dir: str):
-    subprocess.check_call(f"adb shell am force-stop {package_name}", shell=True)
-    subprocess.check_call("adb shell su -c '\"echo 3 > /proc/sys/vm/drop_caches\"'", shell=True)
+def is_emulator() -> bool:
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "getprop", "ro.boot.qemu"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip() == "1"
+    except subprocess.CalledProcessError:
+        return False
 
-    p = None
+
+def collect_trace(package_name: str, output_dir: str):
+    """
+    Collect trace data from the Android device.
+
+    Args:
+        package_name: Name of the Android package to trace
+        output_dir: Directory where trace files will be saved
+    """
+    # Stop the package
+    print("Force stopping process...")
+    subprocess.run(
+        ["adb", "shell", "am", "force-stop", package_name],
+        check=True,
+        text=True,
+    )
+
+    # Clear page cache
+    print("Clearing page cache...")
+    subprocess.run(
+        ["adb", "shell", "setprop", "perf.drop_caches", "3"],
+        check=True,
+        text=True,
+    )
+
+    # Wait until `getprop` returns a value
+    while (
+        subprocess.check_output(
+            ["adb", "shell", "getprop", "perf.drop_caches"], text=True
+        ).strip()
+        != "0"
+    ):
+        time.sleep(0.1)
+
+    # Start tracing
+    trace_file = os.path.join(output_dir, "faults.pftrace")
+
+    # Start the trace process
     try:
         p = subprocess.Popen(
-            f"./record_android_trace -c ftrace.config -n -o {os.path.join(output_dir, 'faults.pftrace')} -tt",
+            f"./record_android_trace -c ftrace.config -n -o {trace_file} -tt",
             stdin=subprocess.PIPE,
             shell=True,
         )
         p.wait()
     except KeyboardInterrupt:
-        pass
+        print("Tracing stopped. Waiting for process to finish...")
     finally:
         if p:
             p.wait()
+        print(f"Trace collected at {trace_file}")
+
 
 def get_arch() -> str:
     return subprocess.check_output(
@@ -198,7 +247,7 @@ def parse_maps(output_dir: str) -> List[Dict]:
     # 77593e689000-77593e693000: 77593e689000-77593e693000 r--p 00148000 07:30 14     /apex/com.android.runtime/bin/linker64
     with open(f"{output_dir}/maps.txt") as file:
         for line in file.readlines():
-            columns = re.split("\s+", line.strip())
+            columns = re.split(r"\s+", line.strip())
 
             addr_space = columns[0]
             offset = columns[2]
@@ -262,7 +311,7 @@ def compute_inode_mapping(output_dir: str) -> Dict[Tuple[int, int], str]:
     with open(os.path.join(output_dir, "inodes.txt"), "r") as f:
         inode_lines = f.read().split("\n")
 
-    inode_re = re.compile("^(?P<dev>[0-9]+)\s(?P<inode>[0-9]+)\s(?P<filename>.*)$")
+    inode_re = re.compile(r"^(?P<dev>[0-9]+)\s(?P<inode>[0-9]+)\s(?P<filename>.*)$")
     inode_mapping = {}
     for line in inode_lines:
         match = inode_re.match(line)
