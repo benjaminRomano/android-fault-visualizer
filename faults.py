@@ -8,6 +8,9 @@ import shutil
 import subprocess
 from zipfile import ZipFile
 
+# TODO: Support arbitrary page sizes
+PAGE_SIZE = 4096
+
 
 def adb_root_command() -> str:
     if has_root():
@@ -131,7 +134,7 @@ def parse_add_to_page_cache(
             row["sdev"] = int(row["sdev"])
             row["inode"] = int(row["inode"])
             # Use byte offests to match user_page_faults
-            row["offset"] = int(row["offset"]) * 4096
+            row["offset"] = int(row["offset"]) * PAGE_SIZE
             user_page_fault_entries.append(row)
 
     return user_page_fault_entries
@@ -160,7 +163,7 @@ def dump_inodes(output_dir: str):
                     "shell",
                     "su",
                     "-c",
-                    'find /apex /system /data /vendor -print0 \\| xargs -0 stat -c "%d %i %n"',
+                    'find /apex /system /data /vendor -print0 | xargs -0 stat -c "%d %i %n"',
                 ],
                 encoding="utf-8",
             ).strip()
@@ -416,7 +419,7 @@ def compute_page_cache_mappings(
         # Assume 4KB page size with 128KB lookahead
         fetched_pages.add(file_offset)
         for n in range(1, 33):
-            fetched_pages.add(file_offset + 4096 * n)
+            fetched_pages.add(file_offset + PAGE_SIZE * n)
         page_faulted_sections[file_name] = fetched_pages
 
         page_fault_mappings.append(
@@ -481,13 +484,13 @@ def compute_user_page_fault_mappings(
         fetched_pages = page_faulted_sections.get(file_name, None)
         if not fetched_pages:
             fetched_pages = set()
-        page_aligned_offset = file_offset - file_offset % 4096
+        page_aligned_offset = file_offset - file_offset % PAGE_SIZE
         is_major = page_aligned_offset not in fetched_pages
 
         # Assume 4KB page size with 128KB lookahead
         fetched_pages.add(page_aligned_offset)
         for n in range(1, 33):
-            fetched_pages.add(page_aligned_offset + 4096 * n)
+            fetched_pages.add(page_aligned_offset + PAGE_SIZE * n)
         page_faulted_sections[file_name] = fetched_pages
 
         page_fault_mappings.append(
@@ -523,84 +526,85 @@ def compute_user_page_fault_mappings(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Process page faults")
-
-    subparsers = parser.add_subparsers(dest="command", help="Choose a command")
-
-    collect = subparsers.add_parser("collect", help="Collect fault data")
-    collect.add_argument(
-        "--output", type=str, default="output", help="Output directory"
+    parser = argparse.ArgumentParser(
+        description="Collect and process Android page faults"
     )
-    collect.add_argument("--package", type=str, required=True, help="Package name")
 
-    process = subparsers.add_parser("process", help="Process fault data")
+    # Main arguments
+    parser.add_argument(
+        "--package", type=str, required=True, help="Android package name to analyze"
+    )
 
-    process.add_argument("--package", type=str, required=True, help="Package name")
-    process.add_argument(
+    # Optional arguments
+    parser.add_argument(
         "--output",
         type=str,
         default="output",
-        help="Output directory to process",
+        help="Output directory (default: output)",
     )
-    process.add_argument(
+    parser.add_argument(
         "--pull-apks",
         action="store_true",
         default=False,
-        help="Whether to pull APKs to get details on which file a page fault in APK corresponds to",
+        help="Pull APKs to get details on which file a page fault in APK corresponds to (default: false)",
+    )
+    parser.add_argument(
+        "--skip-collect",
+        action="store_true",
+        default=False,
+        help="Skip data collection and process previously collected data (default: false)",
     )
 
     args = parser.parse_args()
-    if args.command == "collect":
+
+    # Collection phase (unless skipped)
+    if not args.skip_collect:
+        print(f"Collecting data for package: {args.package}")
         shutil.rmtree(args.output, ignore_errors=True)
         os.makedirs(args.output, exist_ok=True)
-
         collect_trace(args.package, args.output)
 
         if "arm" in get_arch():
             dump_inodes(args.output)
         else:
             dump_maps(args.package, args.output)
-    elif args.command == "process":
-        if "arm" in get_arch():
-            page_cache_entries = parse_add_to_page_cache(
-                args.package, args.output, os.path.join(args.output, "faults.pftrace")
-            )
 
-            inode_mappings = compute_inode_mapping(args.output)
-
-            file_names = list(
-                set(
-                    filter(
-                        lambda x: x is not None,
-                        [
-                            inode_mappings.get((e["sdev"], e["inode"]), None)
-                            for e in page_cache_entries
-                        ],
-                    )
+    # Processing phase
+    print("Processing collected data...")
+    if "arm" in get_arch():
+        page_cache_entries = parse_add_to_page_cache(
+            args.package, args.output, os.path.join(args.output, "faults.pftrace")
+        )
+        inode_mappings = compute_inode_mapping(args.output)
+        file_names = list(
+            set(
+                filter(
+                    lambda x: x is not None,
+                    [
+                        inode_mappings.get((e["sdev"], e["inode"]), None)
+                        for e in page_cache_entries
+                    ],
                 )
             )
-
-            pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
-
-            compute_file_sizes(file_names, args.output, pulled_apks)
-            compute_page_cache_mappings(
-                page_cache_entries, inode_mappings, pulled_apks, args.output
-            )
-        else:
-            user_page_faults = parse_user_page_faults(
-                args.package, args.output, os.path.join(args.output, "faults.pftrace")
-            )
-            map_entries = parse_maps(args.output)
-
-            file_names = list(set([e["file_name"] for e in map_entries]))
-
-            pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
-            compute_file_sizes(file_names, args.output, pulled_apks)
-            compute_user_page_fault_mappings(
-                user_page_faults, map_entries, pulled_apks, args.output
-            )
+        )
+        pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
+        compute_file_sizes(file_names, args.output, pulled_apks)
+        compute_page_cache_mappings(
+            page_cache_entries, inode_mappings, pulled_apks, args.output
+        )
     else:
-        parser.print_help()
+        user_page_faults = parse_user_page_faults(
+            args.package, args.output, os.path.join(args.output, "faults.pftrace")
+        )
+        map_entries = parse_maps(args.output)
+        file_names = list(set([e["file_name"] for e in map_entries]))
+        pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
+        compute_file_sizes(file_names, args.output, pulled_apks)
+        compute_user_page_fault_mappings(
+            user_page_faults, map_entries, pulled_apks, args.output
+        )
+
+    print("Analysis complete. Results are in:", os.path.abspath(args.output))
 
 
 if __name__ == "__main__":
