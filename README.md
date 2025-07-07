@@ -9,7 +9,7 @@ These scripts were created to help evaluate the efficacy of code locality optimi
 
 These scripts are inspired by the page fault animation from the [Droidcon SF 2017 Redex presentation](https://www.youtube.com/watch?v=vtxJvJj6gSE).
 
-Check out the [example](./docs/example.md) to see how these scripts can be used to analyze an app's DEX code locality improvements.
+Check out the [example](./docs/example.md) to see how these scripts can be used to analyze an app's DEX code locality improvements and [How it Works](./docs/how-it-works.md) to learn how page faults are collected and processed.
 
 ## Prerequisites
 
@@ -91,6 +91,8 @@ It is recommended to include minor page faults (i.e page faults that did not req
 picture of the efficacy of code locality. In an ideal case, there is a linear scan of pages with a mixture of major and minor page faults (due to disk readahead).
 
 ![](./images/dex-visualization.png)
+
+**Caveat:** Whether a page fault is major or minor is determined using heuristics. Check out [docs](./docs/how-it-works.md) for more details.
 
 ### Diffing
 
