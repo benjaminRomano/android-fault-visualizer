@@ -1,0 +1,12 @@
+file_name,zip_entry_name,size,file_offset
+/product/overlay/PixelConfigOverlayCommon.apk,,52833,0
+/product/overlay/EmulationPixel6/EmulationPixel6Overlay.apk,,8542,0
+/data/app/~~XUYH8MzcLFrfAL3iZ6yITQ==/com.snapchat.android-sVCz_pVpqQlG-noZR46kyw==/oat/x86_64/base.vdex,,70001884,0
+/product/overlay/LargeScreenConfigOverlay.apk,,12638,0
+/product/overlay/GoogleConfigOverlay.apk,,188993,0
+/data/app/~~XUYH8MzcLFrfAL3iZ6yITQ==/com.snapchat.android-sVCz_pVpqQlG-noZR46kyw==/lib/arm64/libferrite-launcher-03dcd08.so,,32288,0
+/product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk,,12638,0
+/product/overlay/framework-res__auto_generated_rro_product.apk,,12709,0
+/data/app/~~XUYH8MzcLFrfAL3iZ6yITQ==/com.snapchat.android-sVCz_pVpqQlG-noZR46kyw==/base.apk,,145408184,0
+/data/app/~~XUYH8MzcLFrfAL3iZ6yITQ==/com.snapchat.android-sVCz_pVpqQlG-noZR46kyw==/lib/arm64/libclient.so,,32288784,0
+/product/overlay/GoogleWebViewOverlay.apk,,12719,0

@@ -2,10 +2,14 @@ import argparse
 import csv
 import os
 import re
+from typing import Optional, Tuple, List, Dict
+import time
 import shutil
 import subprocess
-from typing import Optional, Dict, List, Tuple
 from zipfile import ZipFile
+
+# TODO: Support arbitrary page sizes
+PAGE_SIZE = 4096
 
 
 def adb_root_command() -> str:
@@ -130,13 +134,14 @@ def parse_add_to_page_cache(
             row["sdev"] = int(row["sdev"])
             row["inode"] = int(row["inode"])
             # Use byte offests to match user_page_faults
-            row["offset"] = int(row["offset"]) * 4096
+            row["offset"] = int(row["offset"]) * PAGE_SIZE
             user_page_fault_entries.append(row)
 
     return user_page_fault_entries
 
 
 def dump_maps(package_name: str, output_dir: str):
+    print("Dumping maps...")
     pid = subprocess.check_output(
         f"adb shell pidof {package_name}", encoding="utf-8", shell=True
     ).strip()
@@ -158,30 +163,77 @@ def dump_inodes(output_dir: str):
                     "shell",
                     "su",
                     "-c",
-                    "find /apex /system /data /vendor -print0 \| xargs -0 stat -c '\"%d %i %n\"'",
+                    'find /apex /system /data /vendor -print0 | xargs -0 stat -c "%d %i %n"',
                 ],
                 encoding="utf-8",
             ).strip()
         )
 
 
-def collect_trace(package_name: str, output_dir: str):
-    subprocess.check_call(f"adb shell am force-stop {package_name}", shell=True)
-    subprocess.check_call("adb shell su -c '\"echo 3 > /proc/sys/vm/drop_caches\"'", shell=True)
+def is_emulator() -> bool:
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "getprop", "ro.boot.qemu"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip() == "1"
+    except subprocess.CalledProcessError:
+        return False
 
-    p = None
+
+def collect_trace(package_name: str, output_dir: str):
+    """
+    Collect trace data from the Android device.
+
+    Args:
+        package_name: Name of the Android package to trace
+        output_dir: Directory where trace files will be saved
+    """
+    # Stop the package
+    print("Force stopping process...")
+    subprocess.run(
+        ["adb", "shell", "am", "force-stop", package_name],
+        check=True,
+        text=True,
+    )
+
+    # Clear page cache
+    print("Clearing page cache...")
+    subprocess.run(
+        ["adb", "shell", "setprop", "perf.drop_caches", "3"],
+        check=True,
+        text=True,
+    )
+
+    # Wait until `getprop` returns a value
+    while (
+        subprocess.check_output(
+            ["adb", "shell", "getprop", "perf.drop_caches"], text=True
+        ).strip()
+        != "0"
+    ):
+        time.sleep(0.1)
+
+    # Start tracing
+    trace_file = os.path.join(output_dir, "faults.pftrace")
+
+    # Start the trace process
     try:
         p = subprocess.Popen(
-            f"./record_android_trace -c ftrace.config -n -o {os.path.join(output_dir, 'faults.pftrace')} -tt",
+            f"./record_android_trace -c ftrace.config -n -o {trace_file} -tt",
             stdin=subprocess.PIPE,
             shell=True,
         )
         p.wait()
     except KeyboardInterrupt:
-        pass
+        print("Tracing stopped. Waiting for process to finish...")
     finally:
         if p:
             p.wait()
+        print(f"Trace collected at {trace_file}")
+
 
 def get_arch() -> str:
     return subprocess.check_output(
@@ -198,7 +250,7 @@ def parse_maps(output_dir: str) -> List[Dict]:
     # 77593e689000-77593e693000: 77593e689000-77593e693000 r--p 00148000 07:30 14     /apex/com.android.runtime/bin/linker64
     with open(f"{output_dir}/maps.txt") as file:
         for line in file.readlines():
-            columns = re.split("\s+", line.strip())
+            columns = re.split(r"\s+", line.strip())
 
             addr_space = columns[0]
             offset = columns[2]
@@ -262,7 +314,7 @@ def compute_inode_mapping(output_dir: str) -> Dict[Tuple[int, int], str]:
     with open(os.path.join(output_dir, "inodes.txt"), "r") as f:
         inode_lines = f.read().split("\n")
 
-    inode_re = re.compile("^(?P<dev>[0-9]+)\s(?P<inode>[0-9]+)\s(?P<filename>.*)$")
+    inode_re = re.compile(r"^(?P<dev>[0-9]+)\s(?P<inode>[0-9]+)\s(?P<filename>.*)$")
     inode_mapping = {}
     for line in inode_lines:
         match = inode_re.match(line)
@@ -367,7 +419,7 @@ def compute_page_cache_mappings(
         # Assume 4KB page size with 128KB lookahead
         fetched_pages.add(file_offset)
         for n in range(1, 33):
-            fetched_pages.add(file_offset + 4096 * n)
+            fetched_pages.add(file_offset + PAGE_SIZE * n)
         page_faulted_sections[file_name] = fetched_pages
 
         page_fault_mappings.append(
@@ -432,13 +484,13 @@ def compute_user_page_fault_mappings(
         fetched_pages = page_faulted_sections.get(file_name, None)
         if not fetched_pages:
             fetched_pages = set()
-        page_aligned_offset = file_offset - file_offset % 4096
+        page_aligned_offset = file_offset - file_offset % PAGE_SIZE
         is_major = page_aligned_offset not in fetched_pages
 
         # Assume 4KB page size with 128KB lookahead
         fetched_pages.add(page_aligned_offset)
         for n in range(1, 33):
-            fetched_pages.add(page_aligned_offset + 4096 * n)
+            fetched_pages.add(page_aligned_offset + PAGE_SIZE * n)
         page_faulted_sections[file_name] = fetched_pages
 
         page_fault_mappings.append(
@@ -474,84 +526,85 @@ def compute_user_page_fault_mappings(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Process page faults")
-
-    subparsers = parser.add_subparsers(dest="command", help="Choose a command")
-
-    collect = subparsers.add_parser("collect", help="Collect fault data")
-    collect.add_argument(
-        "--output", type=str, default="output", help="Output directory"
+    parser = argparse.ArgumentParser(
+        description="Collect and process Android page faults"
     )
-    collect.add_argument("--package", type=str, required=True, help="Package name")
 
-    process = subparsers.add_parser("process", help="Process fault data")
+    # Main arguments
+    parser.add_argument(
+        "--package", type=str, required=True, help="Android package name to analyze"
+    )
 
-    process.add_argument("--package", type=str, required=True, help="Package name")
-    process.add_argument(
+    # Optional arguments
+    parser.add_argument(
         "--output",
         type=str,
         default="output",
-        help="Output directory to process",
+        help="Output directory (default: output)",
     )
-    process.add_argument(
+    parser.add_argument(
         "--pull-apks",
         action="store_true",
         default=False,
-        help="Whether to pull APKs to get details on which file a page fault in APK corresponds to",
+        help="Pull APKs to get details on which file a page fault in APK corresponds to (default: false)",
+    )
+    parser.add_argument(
+        "--skip-collect",
+        action="store_true",
+        default=False,
+        help="Skip data collection and process previously collected data (default: false)",
     )
 
     args = parser.parse_args()
-    if args.command == "collect":
+
+    # Collection phase (unless skipped)
+    if not args.skip_collect:
+        print(f"Collecting data for package: {args.package}")
         shutil.rmtree(args.output, ignore_errors=True)
         os.makedirs(args.output, exist_ok=True)
-
         collect_trace(args.package, args.output)
 
         if "arm" in get_arch():
             dump_inodes(args.output)
         else:
             dump_maps(args.package, args.output)
-    elif args.command == "process":
-        if "arm" in get_arch():
-            page_cache_entries = parse_add_to_page_cache(
-                args.package, args.output, os.path.join(args.output, "faults.pftrace")
-            )
 
-            inode_mappings = compute_inode_mapping(args.output)
-
-            file_names = list(
-                set(
-                    filter(
-                        lambda x: x is not None,
-                        [
-                            inode_mappings.get((e["sdev"], e["inode"]), None)
-                            for e in page_cache_entries
-                        ],
-                    )
+    # Processing phase
+    print("Processing collected data...")
+    if "arm" in get_arch():
+        page_cache_entries = parse_add_to_page_cache(
+            args.package, args.output, os.path.join(args.output, "faults.pftrace")
+        )
+        inode_mappings = compute_inode_mapping(args.output)
+        file_names = list(
+            set(
+                filter(
+                    lambda x: x is not None,
+                    [
+                        inode_mappings.get((e["sdev"], e["inode"]), None)
+                        for e in page_cache_entries
+                    ],
                 )
             )
-
-            pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
-
-            compute_file_sizes(file_names, args.output, pulled_apks)
-            compute_page_cache_mappings(
-                page_cache_entries, inode_mappings, pulled_apks, args.output
-            )
-        else:
-            user_page_faults = parse_user_page_faults(
-                args.package, args.output, os.path.join(args.output, "faults.pftrace")
-            )
-            map_entries = parse_maps(args.output)
-
-            file_names = list(set([e["file_name"] for e in map_entries]))
-
-            pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
-            compute_file_sizes(file_names, args.output, pulled_apks)
-            compute_user_page_fault_mappings(
-                user_page_faults, map_entries, pulled_apks, args.output
-            )
+        )
+        pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
+        compute_file_sizes(file_names, args.output, pulled_apks)
+        compute_page_cache_mappings(
+            page_cache_entries, inode_mappings, pulled_apks, args.output
+        )
     else:
-        parser.print_help()
+        user_page_faults = parse_user_page_faults(
+            args.package, args.output, os.path.join(args.output, "faults.pftrace")
+        )
+        map_entries = parse_maps(args.output)
+        file_names = list(set([e["file_name"] for e in map_entries]))
+        pulled_apks = pull_apks(file_names, args.output) if args.pull_apks else {}
+        compute_file_sizes(file_names, args.output, pulled_apks)
+        compute_user_page_fault_mappings(
+            user_page_faults, map_entries, pulled_apks, args.output
+        )
+
+    print("Analysis complete. Results are in:", os.path.abspath(args.output))
 
 
 if __name__ == "__main__":

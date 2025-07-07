@@ -1,0 +1,14 @@
+[project]
+name = "android-fault-visualizer"
+version = "0.1.0"
+description = "Scripts to analyze Android startup page fault patterns"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "black[jupyter]>=25.1.0",
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.7",
+    "jupyter>=1.1.1",
+    "pandas>=2.3.0",
+    "plotly>=6.2.0",
+]
