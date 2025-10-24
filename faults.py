@@ -414,12 +414,14 @@ def compute_page_cache_mappings(
         fetched_pages = page_faulted_sections.get(file_name, None)
         if not fetched_pages:
             fetched_pages = set()
-        is_major = file_offset not in fetched_pages
+        page_aligned_offset = file_offset - file_offset % PAGE_SIZE
+        is_major = page_aligned_offset not in fetched_pages
 
-        # Assume 4KB page size with 128KB lookahead
-        fetched_pages.add(file_offset)
-        for n in range(1, 33):
-            fetched_pages.add(file_offset + PAGE_SIZE * n)
+        # Always record the page itself; only assume readahead after a major fault
+        fetched_pages.add(page_aligned_offset)
+        if is_major:
+            for n in range(1, 33):
+                fetched_pages.add(page_aligned_offset + PAGE_SIZE * n)
         page_faulted_sections[file_name] = fetched_pages
 
         page_fault_mappings.append(
@@ -487,10 +489,11 @@ def compute_user_page_fault_mappings(
         page_aligned_offset = file_offset - file_offset % PAGE_SIZE
         is_major = page_aligned_offset not in fetched_pages
 
-        # Assume 4KB page size with 128KB lookahead
+        # Always record the page itself; only assume readahead after a major fault
         fetched_pages.add(page_aligned_offset)
-        for n in range(1, 33):
-            fetched_pages.add(page_aligned_offset + PAGE_SIZE * n)
+        if is_major:
+            for n in range(1, 33):
+                fetched_pages.add(page_aligned_offset + PAGE_SIZE * n)
         page_faulted_sections[file_name] = fetched_pages
 
         page_fault_mappings.append(
