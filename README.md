@@ -15,7 +15,7 @@ Check out the [example](./docs/example.md) to see how these scripts can be used 
 
 - Python 3.13
 - [uv](https://github.com/astral-sh/uv)
-- A rooted device (preferred) or Android emulator
+- ⚠️ Devices on Android 12 or newer aggressively preload DEX code with `madvise(WILLNEED)`, which hides true major page faults. For accurate visualizations stick to Android 11 or earlier hardware or emulator images.
 
 ## Getting Started
 

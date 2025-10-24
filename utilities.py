@@ -40,7 +40,7 @@ def extract_faults(
     zip_entry_name: Optional[str],
     file_sizes,
     mapped_faults,
-    include_minor: bool,
+    include_minor: bool = False,
 ):
     """
     Extract the faults mathcing the file name and optional zip entry name

@@ -2,6 +2,8 @@ import argparse
 import csv
 import os
 import re
+import shlex
+from functools import lru_cache
 from typing import Optional, Tuple, List, Dict
 import time
 import shutil
@@ -12,18 +14,54 @@ from zipfile import ZipFile
 PAGE_SIZE = 4096
 
 
-def adb_root_command() -> str:
-    if has_root():
-        return "adb shell"
-    else:
-        return "adb shell su -c"
-
-
+@lru_cache(maxsize=1)
 def has_root() -> bool:
-    return (
-        "adbd cannot run as root in production builds"
-        not in subprocess.check_output("adb root", shell=True, text=True)
+    try:
+        output = subprocess.check_output("adb root", shell=True, text=True)
+        return "adbd cannot run as root in production builds" not in output
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _shell_executes_as_root(prefix: List[str]) -> bool:
+    try:
+        result = subprocess.run(
+            prefix + ["id"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+        return "uid=0" in result.stdout
+    except subprocess.CalledProcessError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def get_root_shell_prefix() -> List[str]:
+    candidates: List[List[str]] = []
+    if has_root():
+        candidates.append(["adb", "shell", "sh", "-c"])
+
+    candidates.extend(
+        [
+            ["adb", "shell", "su", "0", "sh", "-c"],
+            ["adb", "shell", "su", "-c"],
+        ]
     )
+
+    for prefix in candidates:
+        if _shell_executes_as_root(prefix):
+            return prefix
+
+    raise RuntimeError(
+        "Unable to acquire a root shell over adb. Ensure the device or emulator provides root access."
+    )
+
+
+def run_root_shell(command: str, **kwargs) -> subprocess.CompletedProcess:
+    prefix = get_root_shell_prefix()
+    return subprocess.run(prefix + [command], **kwargs)
 
 
 def find_map_entry(map_entries, addr: int) -> Optional[any]:
@@ -145,29 +183,20 @@ def dump_maps(package_name: str, output_dir: str):
     pid = subprocess.check_output(
         f"adb shell pidof {package_name}", encoding="utf-8", shell=True
     ).strip()
-    subprocess.run(
-        f"{adb_root_command()} 'cat /proc/{pid}/maps' > {os.path.join(output_dir, 'maps.txt')}",
-        shell=True,
-        check=True,
+    result = run_root_shell(
+        f"cat /proc/{pid}/maps", check=True, capture_output=True, text=True
     )
+    with open(os.path.join(output_dir, "maps.txt"), "w", encoding="utf-8") as f:
+        f.write(result.stdout)
 
 
 def dump_inodes(output_dir: str):
     print("Dumping inodes...")
 
-    with open(os.path.join(output_dir, "inodes.txt"), "w") as f:
-        f.write(
-            subprocess.check_output(
-                [
-                    "adb",
-                    "shell",
-                    "su",
-                    "-c",
-                    'find /apex /system /data /vendor -print0 | xargs -0 stat -c "%d %i %n"',
-                ],
-                encoding="utf-8",
-            ).strip()
-        )
+    command = 'find /apex /system /data /vendor -print0 | xargs -0 stat -c "%d %i %n"'
+    result = run_root_shell(command, check=True, capture_output=True, text=True)
+    with open(os.path.join(output_dir, "inodes.txt"), "w", encoding="utf-8") as f:
+        f.write(result.stdout.strip())
 
 
 def is_emulator() -> bool:
@@ -201,11 +230,7 @@ def collect_trace(package_name: str, output_dir: str):
 
     # Clear page cache
     print("Clearing page cache...")
-    subprocess.run(
-        ["adb", "shell", "setprop", "perf.drop_caches", "3"],
-        check=True,
-        text=True,
-    )
+    run_root_shell("setprop perf.drop_caches 3", check=True)
 
     # Wait until `getprop` returns a value
     while (
@@ -354,16 +379,14 @@ def compute_file_sizes(
             if file_name in seen_files or not is_maybe_package_code(file_name):
                 continue
             seen_files.add(file_name)
-            file_size = (
-                subprocess.run(
-                    f"adb shell wc {file_name}",
-                    shell=True,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                )
-                .stdout.decode("utf-8")
-                .split(" ")[2]
+            quoted_name = shlex.quote(file_name)
+            result = run_root_shell(
+                f"wc {quoted_name}",
+                check=True,
+                capture_output=True,
+                text=True,
             )
+            file_size = result.stdout.strip().split()[2]
             writer.writerow(
                 {
                     "file_name": file_name,
