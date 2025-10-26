@@ -61,7 +61,24 @@ def get_root_shell_prefix() -> List[str]:
 
 def run_root_shell(command: str, **kwargs) -> subprocess.CompletedProcess:
     prefix = get_root_shell_prefix()
-    return subprocess.run(prefix + [command], **kwargs)
+    # Ensure proper command escaping when using `-c`
+    if prefix and prefix[-1] == "-c":
+        escaped_command = command.replace("\\", "\\\\").replace('"', '\\"')
+        command_arg = f'"{escaped_command}"'
+    else:
+        command_arg = command
+    return subprocess.run(prefix + [command_arg], **kwargs)
+
+
+@lru_cache(maxsize=1)
+def get_device_sdk_version() -> int:
+    """
+    Returns the device SDK version as an integer.
+    """
+    output = subprocess.check_output(
+        ["adb", "shell", "getprop", "ro.build.version.sdk"], text=True
+    )
+    return int(output.strip())
 
 
 def find_map_entry(map_entries, addr: int) -> Optional[any]:
@@ -230,16 +247,19 @@ def collect_trace(package_name: str, output_dir: str):
 
     # Clear page cache
     print("Clearing page cache...")
-    run_root_shell("setprop perf.drop_caches 3", check=True)
-
-    # Wait until `getprop` returns a value
-    while (
-        subprocess.check_output(
-            ["adb", "shell", "getprop", "perf.drop_caches"], text=True
-        ).strip()
-        != "0"
-    ):
-        time.sleep(0.1)
+    sdk_version = get_device_sdk_version()
+    if sdk_version < 31:
+        run_root_shell("echo 3 > /proc/sys/vm/drop_caches", check=True)
+    else:
+        run_root_shell("setprop perf.drop_caches 3", check=True)
+        # Wait until `getprop` returns a value
+        while (
+            subprocess.check_output(
+                ["adb", "shell", "getprop", "perf.drop_caches"], text=True
+            ).strip()
+            != "0"
+        ):
+            time.sleep(0.1)
 
     # Start tracing
     trace_file = os.path.join(output_dir, "faults.pftrace")

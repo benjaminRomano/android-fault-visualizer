@@ -21,7 +21,7 @@ data_sources: {
 }
 ```
 
-To ensure representative disk I/O is captured, the app is force-stopped (`am force-stop`) and the page cache is flushed (`setprop sys.drop_caches 3`) before the recording begins. Disk I/O occurring can be sanity checked by inspecting thread states. Throughout the threads of the app should be orange sections which corresponds to "Uninterruptible Sleep", which is approximately equivalent to disk I/O.
+To ensure representative disk I/O is captured, the app is force-stopped (`am force-stop`) and the page cache is flushed (SDK < 31: `echo 3 > /proc/sys/vm/drop_caches`, SDK ≥ 31: `setprop perf.drop_caches 3`) before the recording begins. Disk I/O occurring can be sanity checked by inspecting thread states. Throughout the threads of the app should be orange sections which corresponds to "Uninterruptible Sleep", which is approximately equivalent to disk I/O.
 
 ![trace](../images/disk-io.png)
 
