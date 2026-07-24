@@ -1,178 +1,243 @@
-# How it Works
+# How it works
 
-## Collecting a trace
+## Measurement model
 
-To analyze page faults, we first need a Perfetto trace that captures the relevant page fault events.
-In the `ftrace.config`, we want to capture the [page_fault_user](https://github.com/torvalds/linux/blob/v6.15/arch/x86/mm/fault.c#L1462C3-L1462C24) and [mm_filemap_add_to_page_cache](https://github.com/torvalds/linux/blob/v6.15/mm/filemap.c#L948) trace points and Android startup events:
+The native collector opens the Linux perf software events
+`PERF_COUNT_SW_PAGE_FAULTS_MAJ` and `PERF_COUNT_SW_PAGE_FAULTS_MIN` on every CPU
+before the app process exists. Each sample contains the faulting process/thread,
+timestamp, instruction pointer, fault address, and CPU. After collection, the
+events are filtered to the launched PID and Perfetto's one Android startup
+interval.
 
-```
-data_sources: {
-    config {
-        name: "linux.ftrace"
-        ftrace_config {
-            // Page fault tracepoints
-            ftrace_events: "exceptions/page_fault_user"
-            ftrace_events: "filemap/mm_filemap_add_to_page_cache"
-            // Android startup events
-            atrace_apps: "*"
-            // ...
-        }
-    }
-}
-```
+This is architecture-independent and follows the kernel's post-resolution
+major/minor accounting. It replaces two inaccurate behaviors in the original
+implementation:
 
-To ensure representative disk I/O is captured, the app is force-stopped (`am force-stop`) and the page cache is flushed (SDK < 31: `echo 3 > /proc/sys/vm/drop_caches`, SDK ≥ 31: `setprop perf.drop_caches 3`) before the recording begins. Disk I/O occurring can be sanity checked by inspecting thread states. Throughout the threads of the app should be orange sections which corresponds to "Uninterruptible Sleep", which is approximately equivalent to disk I/O.
+- `mm_filemap_add_to_page_cache` means a page or folio was inserted into a
+  file's page cache. It can represent synchronous I/O or readahead, but is not a
+  page-fault event.
+- A fixed 128 KiB readahead window cannot determine whether a fault was major or
+  minor. The kernel's classification is recorded directly instead.
 
-![trace](../images/disk-io.png)
+The collector fails the capture if its perf ring buffers report lost samples.
+Major remains a Linux VM classification (`VM_FAULT_MAJOR`), not a direct
+measurement at the storage controller.
 
-## Processing Page Faults
+## File attribution
 
-Processing page faults is architecture-specific as different page fault tracepoints are available.
+The perf collector records timestamped `PERF_RECORD_MMAP2` events, including data
+mappings, from before the app process exists. A sampled fault is resolved using
+the most recent mapping record active at that timestamp. The tool also captures
+`/proc/<pid>/maps` after launch as a fallback for mappings inherited from Zygote
+that predate collection. A sampled address is attributed only when it lies in a
+half-open mapping range `[start, end)` with a nonzero inode and a regular-file
+path. The file offset is:
 
-### x86 / Emulators
-
-On x86, the `page_fault_user` ftrace event is used. This event includes the `address` as one of it's arguments.
-
-```c
-DEFINE_EVENT(exceptions, page_fault_user,
-	TP_PROTO(unsigned long address,	struct pt_regs *regs, unsigned long error_code),
-	TP_ARGS(address, regs, error_code));
+```text
+mapping file offset + (fault address - mapping start)
 ```
 
-This can be extracted using the following Perfetto SQL query:
+Device numbers use Linux's encoded `dev_t`, so `(device, inode)` from mappings,
+ftrace, and `stat` can be joined correctly. Anonymous mappings and special
+`/dev/*` mappings remain unattributed.
 
-```sql
-INCLUDE PERFETTO MODULE android.startup.startups;
+If a later MMAP2 record overlaps an address, the final snapshot is not applied
+backward in time. This avoids silently assigning an early fault to a mapping
+created later.
 
-SELECT
-ftrace_event.ts,
-process.name as process_name,
-thread.name as thread_name,
-EXTRACT_ARG(ftrace_event.arg_set_id, "address")  as address,
-EXTRACT_ARG(ftrace_event.arg_set_id, "ip")  as ip
-FROM ftrace_event
-    left join thread ON ftrace_event.utid = thread.utid
-    left join process ON thread.upid = process.upid
-WHERE
-ftrace_event.name = 'page_fault_user'
--- Filter to events that are contained within the process' startup
-AND ftrace_event.ts >= (SELECT MIN(ts) from android_startups WHERE package = process.name)
-AND ftrace_event.ts <= (SELECT MIN(ts_end) from android_startups WHERE package = process.name)
-AND process.name = '{process_name}'
-ORDER BY ts ASC
-```
+For APKs, ZIP local headers are parsed to locate the start and end of each
+entry's compressed payload. A fault is assigned to an entry only inside that
+payload range. Local headers, data descriptors, alignment gaps, and the central
+directory remain attributed to the APK container; they are not assigned to the
+nearest preceding entry.
 
-To determine, what file the page fault corresponds to, `/proc/<pid>/maps` is queried to map the adddress to a specific file. The output of that commands looks like the following:
+The page size comes from `getconf PAGESIZE` on the target, so 4 KiB and 16 KiB
+devices use the correct page index.
 
-```bash
-address space | perm | offset | dev (storage device) | inode | file path
-12c00000-52c00000 rw-p 00000000 00:00 0      [anon:dalvik-main space (region space)]
-77593e689000-77593e693000: 77593e689000-77593e693000 r--p 00148000 07:30 14     /apex/com.android.runtime/bin/linker64
-```
+## Page-cache control and verification
 
-### ARM / Physical Devices
+For each iteration the tool:
 
-On ARM devices, the script uses the `mm_filemap_add_to_page_cache` ftrace event.
+1. force-stops the package;
+2. waits until all package processes have exited;
+3. enumerates every regular file in the installed APK and package data
+   directories;
+4. runs `sync` so dirty pages are eligible for eviction;
+5. requests `echo 3 > /proc/sys/vm/drop_caches`, or Android's
+   `perf.drop_caches` init property from the adb `shell` domain where direct
+   sysctl access is unavailable;
+6. applies file-scoped `POSIX_FADV_DONTNEED` to every regular file discovered
+   under the installed APK and package data directories;
+7. re-enumerates the file set and rejects any additions or removals; and
+8. uses `mincore()` after eviction and immediately before launch.
 
-```c
-TP_PROTO(struct folio *folio),
+Linux documents `drop_caches` as dropping clean caches only; it does not
+guarantee that every page remains absent. Android system processes can retain or
+repopulate package files between the drop and launch. Consequently the default
+`--max-resident-pages=0` policy aborts collection before app launch if any
+checked page remains resident. The per-file evidence is still written to
+`cache_residency.csv`. A nonzero threshold is an explicit partially warm policy,
+not a successful cache flush, and becomes comparison provenance.
+Strict failures also retain `capture_metadata.json` with the cache policy,
+device/boot provenance, failure status, and diagnostic message.
 
-TP_ARGS(folio),
+`--reboot-before-collect` is useful when a prior launch left APK pages
+unevictable. Rebooting is not itself accepted as proof of a cold cache: the same
+post-drop and pre-launch `mincore()` gates still have to pass.
+The reboot policy is comparison-gated provenance, while boot ID and device
+uptime remain audit metadata.
 
-TP_STRUCT__entry(
-    __field(unsigned long, pfn)
-    __field(unsigned long, i_ino)
-    __field(unsigned long, index)
-    __field(dev_t, s_dev)
-    __field(unsigned char, order)
-),
+The property fallback intentionally uses plain adb shell rather than explicitly
+routing through `su`. Android's SELinux policy grants `perf.drop_caches` to the
+shell domain; third-party root domains are not necessarily permitted to set it.
+This lets a non-root API 31+ shell request the global drop. It does **not** make
+the complete verified procedure non-root: file-scoped eviction, `mincore()`
+coverage, system-wide address-bearing events, and mapping access still require
+the exact collector's root environment.
 
-DEFINE_EVENT(mm_filemap_op_page_cache, mm_filemap_add_to_page_cache,
-	TP_PROTO(struct folio *folio),
-	TP_ARGS(folio)
-	);
-```
+On a root-adbd userdebug image, plain `adb shell` may itself retain a root
+SELinux domain. Such images normally use the direct sysctl path; if both paths
+are denied, collection fails rather than accepting an unverified cache state.
 
-This can be extracted using the following Perfetto SQL query:
+## Perfetto's role
 
-```sql
-INCLUDE PERFETTO MODULE android.startup.startups;
+Perfetto supplies the Android startup boundary and page-cache insertion evidence.
+The trace records Android startup slices plus
+`mm_filemap_add_to_page_cache`. Cache insertions are written to
+`page_cache_events.csv` with folio order preserved as `page_count`; they never
+enter `faults.csv` or the major/minor counts.
 
-SELECT
-ftrace_event.ts,
-process.name as process_name,
-thread.name as thread_name,
-EXTRACT_ARG(ftrace_event.arg_set_id, "s_dev")  as sdev,
-EXTRACT_ARG(ftrace_event.arg_set_id, "i_ino")  as inode,
-EXTRACT_ARG(ftrace_event.arg_set_id, "index")  as offset
-FROM ftrace_event
-    left join thread ON ftrace_event.utid = thread.utid
-    left join process ON thread.upid = process.upid
-WHERE
-ftrace_event.name = 'mm_filemap_add_to_page_cache'
--- Filter to events that are contained within the process' startup
-AND ftrace_event.ts >= (SELECT MIN(ts) from android_startups WHERE package = process.name)
-AND ftrace_event.ts <= (SELECT MIN(ts_end) from android_startups WHERE package = process.name)
-AND process.name = '{process_name}'
-ORDER BY ts ASC
-```
+The perf collector uses `CLOCK_BOOTTIME`, which is the same time domain used by
+the trace timestamps, so the two streams can be filtered without a wall-clock
+conversion.
 
-Unlike x86, we do not have the raw address of the page fault and therefore cannot directly map page faults to a file using `/proc/<pid>/maps`. Instead, we need to dump the inodes to find perform the mapping.
+Perfetto runs in the foreground with in-memory ring buffers during the measured
+interval. It is interrupted only after startup collection, at which point the
+trace is written. Periodic trace-file streaming is intentionally disabled so
+the instrumentation does not add storage writes to a cold-I/O experiment.
 
-Dumping inodes can be performed using the following command:
+## Optional call stacks
 
-```bash
-adb shell su -c 'find /apex /system /data /vendor -print0 | xargs -0 stat -c "%d %i %n"' > inodes.txt
-```
+Linux perf can attach either a kernel-produced call chain
+(`PERF_SAMPLE_CALLCHAIN`) or the user registers and stack bytes needed for
+offline unwinding (`PERF_SAMPLE_REGS_USER` and `PERF_SAMPLE_STACK_USER`) to a
+software fault sample. Android Simpleperf's DWARF mode uses the latter and can
+resolve Java, ART, framework, and native frames on Android 9 and later.
 
-The output of that command looks like the following:
+Stack capture is intentionally a separate diagnostic pass:
 
-```
-# dev inode filename
-22 1 /apex
-22 88 /apex/.default-apex-info-list.xml
-65040 2 /apex/com.android.adbd
-65040 11 /apex/com.android.adbd/lost+found
-65040 12 /apex/com.android.adbd/bin
-65040 13 /apex/com.android.adbd/bin/adbd
-65040 16 /apex/com.android.adbd/lib64
-65040 24 /apex/com.android.adbd/lib64/libcrypto_utils.so
-65040 17 /apex/com.android.adbd/lib64/libadb_pairing_auth.so
-65040 23 /apex/com.android.adbd/lib64/libcrypto.so
-65040 19 /apex/com.android.adbd/lib64/libadb_pairing_server.so
-65040 21 /apex/com.android.adbd/lib64/libbase.so
-65040 25 /apex/com.android.adbd/lib64/libcutils.so
-```
+- an 8 KiB user-stack snapshot per fault materially increases recording work;
+- Simpleperf attaches after the package process appears, so the earliest faults
+  can be absent;
+- Simpleperf's standard page-fault sample does not retain the fault address used
+  by this project's exact file-attribution pipeline; and
+- running Simpleperf and the exact system-wide collector together can perturb
+  launch and overflow Simpleperf's buffers.
 
-Using this mapping, the page fault events can be mapped to specific files based on the inode argument (`i_ino`).
+The standalone stack command does not execute the exact collector's strict
+cache-eviction and residency gate. Its cache state is therefore unverified and
+its major/minor mix must not be compared directly with a verified cold run.
+`stack_report.py` accepts the Simpleperf recording log, rejects nonzero sample
+loss by default, and retains perf sample periods as weights.
 
-## Identifying Major / Minor Page Faults
+Consequently `stack_report.py` visualizes captured fault call paths, but those
+samples are not silently joined to files or used for authoritative counts and
+timing. Frame-pointer mode is smaller, but optimized ART and native code often
+produce incomplete managed stacks. DWARF mode is the default recommendation for
+the qualitative stack pass.
 
-In both x86 and arm scenarios, we do not get any signal on whether the page fault required accessing the disk. To effectively know if disk I/O was truly performed would require instrumenting down to disk controller.
+## Android-version behavior
 
-As an approximation, we assume that the disk readahead for the profiled device is 128KB. Next, the page faults are processed in-order and we keep track of whether the page accessed would be covered by disk readahead of a previous page fault.
+The event source works across CPU architectures, subject to kernel perf support
+and security policy. The interpretation of a startup still depends on the
+Android release:
 
-## Identifying page faults within APKs
+- Android 10/11 images are useful for explicitly cold code-loading experiments.
+- Android 16/API 36 has been exercised end-to-end on arm64 userdebug emulator
+  images with both 4 KiB and 16 KiB pages. One 4 KiB capture initially failed
+  its strict gate when 182 of 684 APK pages remained resident; a rebooted
+  iteration reached zero and completed. A 16 KiB post-boot attempt likewise
+  rejected 36 of 171 resident APK pages; a subsequent strictly verified
+  iteration reached zero and completed. This is why cache-drop command success
+  is not treated as proof.
+- ART and platform startup components on newer releases may issue
+  `madvise(MADV_WILLNEED)` or other readahead before demand access. That work can
+  convert later demand faults to minor faults or eliminate demand faults
+  altogether.
+- Compilation state changes whether code demand targets ODEX/OAT, VDEX, or APK
+  DEX. Compare builds only after matching compilation mode. On Android 10
+  VDEX 021/002, the report labels each unambiguous CompactDex payload by
+  multidex order. Android 16 currently produces VDEX 027; the report presents
+  the entire VDEX file and deliberately does not guess per-DEX boundaries for
+  that unvalidated format. ODEX byte offsets are not assigned to a dex without
+  method-level OAT metadata.
+- 16 KiB page devices change page counts and locality metrics even when byte
+  layout is unchanged; compare like with like.
 
-When inspecting page faults for the APK itself, it's important to know which file is being accessed. This is achieved by pulling the APK from the device and extracting the size and file offset of each zip entry. Effectively, creating a mapping similar to `/proc/<pid>/maps`, but for an APK instead of a process.
+### Emulator and physical-device capability boundary
 
-## Other Notes
+- **AOSP/Google APIs userdebug/eng emulator:** exact mode works when `adb root`
+  succeeds and the kernel exposes perf plus the required filemap tracepoint.
+  The API 36 AOSP `default` 4 KiB and Google APIs 16 KiB images satisfy those
+  requirements. Play Store AVD images are production `user` builds and do not
+  permit `adb root`.
+- **Rooted physical device:** exact mode can work and is preferable when real
+  storage behavior matters. Root must be usable from adb and its SELinux domain
+  must be allowed to open per-CPU system-wide perf events, read tracefs and
+  `/proc/<pid>`, and inspect app/system files. Magisk/KernelSU does not guarantee
+  those permissions, and some vendor kernels omit or restrict perf.
+- **Non-rooted production device:** Android 12+ shell can request
+  `perf.drop_caches`, and Simpleperf can profile an app marked
+  `profileableFromShell`. In an API 36 production-image audit, Simpleperf
+  captured fault samples, but the audited pass did not request stacks and its
+  sample type omitted `PERF_SAMPLE_ADDR`. AOSP's separate DWARF mode supports
+  call stacks for profileable apps, but without the fault address a sample
+  cannot be mapped to a file or page, and attaching after process creation
+  misses the earliest startup. This is a useful qualitative diagnostic mode,
+  not a replacement for exact capture.
 
-**Determining the location of a method in DEX files**
+The tool reports a root or capability failure rather than falling back to the
+old tracepoint/readahead heuristic.
 
-At runtime, a trace is emitted by the Android Runtime for class initializers (`<clinit>`). Using JADX-GUI, the APK can be disassmebled and the output will specify which DEX file the class is located in (e.g. `classes2.dex`). This can be useful for determining a class is being missed by the startup profile; either the startup profile is incomplete or there is a bug with R8
+## Reading the report
 
-**Debugging source of page faults**
+The address-space overview plots every recorded startup fault at its process
+virtual address. Minor faults use circles and major faults use diamonds; the
+scope control switches between all, regular-file, anonymous/non-regular, and
+unmapped addresses. Hover preserves named anonymous mappings such as stacks and
+JIT caches; regular-file points additionally retain the exact file or APK
+section, file page/offset, thread, category, and capture sequence. Because ASLR
+can move mappings between launches, use this view for within-capture temporal
+patterns and the logical-file comparison views for cross-capture ordering
+comparisons.
 
-`simpleperf` can be used for collecting stacktraces when a page fault occurs. Using Firefox Profiler's stack chart view, the sources of page faults can be easily visualized.
+Minor faults are useful: they show demanded pages that resolved without the
+kernel's major-fault path, often because a page was already cached or supplied
+by readahead. The selectable sequence plot is independent of major/minor
+classification. Its next-page, nearby-step, and median-jump metrics describe
+how tightly demanded file pages are ordered. “Nearby” is 32 pages (128 KiB on
+a 4 KiB-page device), a comparison window rather than a readahead assumption.
 
-Below are roughly the commands to use to get the stacktraces (untested):
+For R8 ordering experiments, focus on the executable artifact actually used by
+the runtime, typically app ODEX/VDEX on an AOT-compiled installation. Compare
+both the file's page sequence and its exact major/minor counts across repeated
+runs; total startup time alone is noisier and can include unrelated Android
+runtime work.
 
-```bash
-# (Not tested) Perform stacktrace sampling and collect a stacktrace when page fault ocurs
-./app_profiler.py -p <package_name> -r "-e page-faults -e task-clock:u -f 1000 -g"
-# Alternatively, collect stacktrace when thread goes off-cpu, which should equally collect stacktraces when the thread goes into kernel space to perform major page fault.
-./app_profiler.py -p <package_name> -r "-e task-clock:u -f 1000 -g --trace-offcpu"
-```
+The comparison report rejects mismatched device/build, kernel, ABI, page size,
+activity, collector source/binary hash, trace-config hash, cache procedure, or
+toolchain metadata. An explicit `--allow-incomparable` override retains a
+prominent mismatch warning for intentional exploratory comparisons.
 
-**Note:** a `userdebug` build is not strictly required. It is only needed to symbolicate kernel frames, but even without symbolication, it's easy to determine which kernel frames correspond to page faults.
+## Primary references
+
+- [Linux `drop_caches` documentation](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html)
+- [Linux perf event ABI](https://www.kernel.org/doc/html/latest/userspace-api/perf_ring_buffer.html)
+- [AOSP arm64 page-fault accounting](https://android.googlesource.com/kernel/arm64/+/f5269100977385d1fd4a5ef68e49631892cf4fe4/arch/arm64/mm/fault.c)
+- [AOSP filemap fault handling](https://android.googlesource.com/kernel/common/+/refs/tags/android16-6.12-2025-06_r12/mm/filemap.c)
+- [AOSP filemap tracepoint definition](https://android.googlesource.com/kernel/msm/+/android-8.1.0_r0.24/include/trace/events/filemap.h)
+- [Android Simpleperf documentation](https://developer.android.com/ndk/guides/simpleperf)
+- [AOSP Android 16 app profiling with Simpleperf](https://android.googlesource.com/platform/system/extras/+/android16-release/simpleperf/doc/android_application_profiling.md)
+- [AOSP Android 16 `perf.drop_caches` init action](https://android.googlesource.com/platform/system/core/+/android16-qpr2-release/rootdir/init.rc)
+- [AOSP shell SELinux policy for `perf.drop_caches`](https://android.googlesource.com/platform/system/sepolicy/+/android16-qpr1-release/private/shell.te)
+- [AOSP ART `MADV_WILLNEED` change](https://android.googlesource.com/platform/art/+/0654153bc5ca22466697681bb6dc4bc8b379975e%5E%21/)

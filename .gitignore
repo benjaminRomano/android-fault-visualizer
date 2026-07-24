@@ -328,5 +328,6 @@ pyrightconfig.json
 record_android_trace
 trace_processor
 /output
+.playwright-cli/
 
 .DS_Store
