@@ -1,16 +1,25 @@
 import csv
-from typing import Optional
-import pandas as pd
+import json
 import os
+from typing import Optional
 
-# TODO: Support variable page sizes. Android will soon support 16KB pages
-PAGE_SIZE = 4096
+import pandas as pd
+
+
+def _parse_bool(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes"}
 
 
 def load_mappings(output_dir: str = "output"):
     """
     Load the Fault mapping (file_name, offset) and the File Sizes (File Name, file size) from the csv files
     """
+    metadata_path = os.path.join(output_dir, "capture_metadata.json")
+    page_size = 4096
+    if os.path.exists(metadata_path):
+        with open(metadata_path) as metadata_file:
+            page_size = int(json.load(metadata_file).get("page_size", page_size))
+
     mapped_faults = []
     with open(os.path.join(output_dir, "mapped_faults.csv")) as csv_file:
         for row in csv.DictReader(csv_file):
@@ -19,7 +28,8 @@ def load_mappings(output_dir: str = "output"):
             )
             row["offset"] = int(row["offset"])
             row["ts"] = int(row["ts"])
-            row["is_major"] = row["is_major"] == "True"
+            row["is_major"] = _parse_bool(row["is_major"])
+            row["page_size"] = page_size
             mapped_faults.append(row)
 
     file_sizes = []
@@ -71,11 +81,18 @@ def extract_faults(
         ]
     )
 
+    if faults.empty:
+        return faults, file_size, file_offset
+
     if not include_minor:
         faults = faults[faults["is_major"]]
 
+    if faults.empty:
+        return faults, file_size, file_offset
+
     # Compute delta between fault offsets
-    faults["offset"] = faults["offset"].div(PAGE_SIZE)
+    page_size = int(faults["page_size"].iloc[0])
+    faults["offset"] = faults["offset"].div(page_size)
     faults["offset_diff"] = faults["offset"].diff()
 
     # Normalize timestamps
