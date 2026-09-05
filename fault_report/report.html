@@ -112,7 +112,7 @@
             data-tab="sites"
             aria-selected="false"
           >
-            Call sites
+            Fault list
           </button>
         </nav>
         <p id="selectedSource"></p>
@@ -153,30 +153,18 @@
           aria-labelledby="tab-stacks"
           hidden
         >
-          <div class="view-toolbar">
-            <span id="stackMode"></span>
-            <label id="firstControl"
-              >First fault
-              <input id="stackStart" type="number" value="1" min="1"
-            /></label>
-            <label id="limitControl"
-              >Show
-              <select id="stackLimit">
-                <option value="0">All faults</option>
-                <option value="50">50 faults</option>
-                <option value="100">100 faults</option>
-                <option value="250">250 faults</option>
-                <option value="500">500 faults</option>
-              </select></label
-            >
-            <button id="stackPrev">Previous</button
-            ><button id="stackNext">Next</button
-            ><button id="stackReset">Reset zoom</button>
-          </div>
           <p id="stackCoverage" class="view-note"></p>
-          <p id="stackCount" class="view-note"></p>
-          <div id="stackScroll">
-            <canvas id="stacks" aria-label="Fault call stacks"></canvas>
+          <p id="stackCount" hidden></p>
+          <div
+            id="stackScroll"
+            tabindex="0"
+            aria-label="Scrollable fault stacks"
+          >
+            <canvas
+              id="stacks"
+              tabindex="0"
+              aria-label="Fault call stacks"
+            ></canvas>
           </div>
           <p id="stackLegend" class="view-note">
             App · blue; system · gray; unresolved · hatched. Hover for full
@@ -190,16 +178,16 @@
           hidden
         >
           <p class="view-note">
-            Major-fault instructions grouped by symbol and source. The
-            instruction binary is not necessarily the file read.
+            Faults in capture order. Select a fault to inspect its full stack.
           </p>
           <div class="table-scroll">
             <table>
               <thead>
                 <tr>
-                  <th>Major</th>
-                  <th>First (ms)</th>
-                  <th>Faulting frame</th>
+                  <th>Fault #</th>
+                  <th>Kind</th>
+                  <th>Time (ms)</th>
+                  <th>Faulting user frame</th>
                   <th id="siteSourceTitle">Read source</th>
                 </tr>
               </thead>

@@ -67,12 +67,32 @@ Offline unwinding can recover managed methods. Export uses the exact launched
 PID, preserves timestamp gaps, and disables callchain joining. Period must be
 one, and recording loss must be zero.
 
-The DWARF stream is not joined to the native stream. Its binaries are
-instruction sources, not read sources. Concurrent profiling perturbs startup
-and can affect native callchain coverage. In the verified dual run, all 27
-major faults lacked native user frames while the companion had 27 major stacks;
-the native-only run had full fault-stack coverage. These are observations, not
-a proof of why individual chains were empty.
+New captures bind Simpleperf artifacts to the same device, boot and native
+recorder start. The report verifies raw perf attributes, artifact hashes and
+loss checks, then matches only unique, exactly equal PID/TID/boottime-nanosecond
+timestamp/instruction-address/CPU identities. Native records are checked against
+processed CSV identities before enrichment. Ambiguity is checked across the
+complete saved streams, not just the displayed startup window. No nearest-time,
+ordinal or count-based pairing is allowed. Missing binding or unsupported raw
+formats leave the streams separate and produce a warning.
+
+Matched stacks supply DWARF user frames, retaining native kernel frames when
+present. The fault address and file attribution still come exclusively from
+the native event; stack instruction binaries are not substituted as read files.
+Unmatched events retain their native stack. The independent DWARF view remains
+available and match coverage is recorded in report provenance. Concurrent
+profiling perturbs startup and can affect native callchain coverage.
+
+On the tested kernel (`d0c43a640eab`), missing native user chains during dual
+recording have a specific explanation. Software-event listeners share one
+`perf_sample_data`; `perf_prepare_sample` caches a previously prepared callchain.
+The newest listener runs first. Simpleperf's DWARF mode excludes user frames
+from that callchain (it unwinds saved user registers/stack instead), so a
+user-mode fault can cache an empty kernel-only chain which the native listener
+then reuses. This is why a missing native chain does not imply no DWARF sample.
+See the exact kernel's [event dispatch and preparation](https://android.googlesource.com/kernel/common/+/d0c43a640eab/kernel/events/core.c),
+[callchain collection](https://android.googlesource.com/kernel/common/+/d0c43a640eab/kernel/events/callchain.c),
+and Android 16 Simpleperf's [DWARF event setup](https://android.googlesource.com/platform/system/extras/+/refs/heads/android16-release/simpleperf/event_selection_set.cpp).
 
 ## File and binary attribution
 
@@ -111,6 +131,16 @@ processes to exit, inventories app-owned files, calls `sync` and
 `drop_caches`, applies `POSIX_FADV_DONTNEED`, and checks `mincore()` after
 eviction and immediately before launch. Zero resident app-file pages is the
 default gate; reboot never bypasses it.
+
+`--reclaim-mapped-apks` additionally attempts bounded `MADV_PAGEOUT` advice on
+read-only mappings of the exact installed APK device/inode pairs in other
+processes. It does not stop those processes, reclaim anonymous memory, or change
+security settings. Advice may skip multiply mapped pages and does not guarantee
+eviction; both zero-residency checks remain mandatory. This is opt-in because it
+affects shared APK mappings outside the stopped app.
+PID and mapping checks before and after advice detect changes, but cannot make
+remote mapping inspection atomic with the kernel call. Concurrent remapping is
+a best-effort limitation; the audit records observed races and advice results.
 
 Installed APK mappings are essential and must all resolve. Optional temporary
 files can disappear with warnings; newly discovered files are evicted and

@@ -6,22 +6,59 @@ async (page) => {
   await page.locator("#run").selectOption("0");
   await page.locator("#reset").click();
   await page.locator("#tab-pages").click();
+  for (const mode of ["offset", "delta-file"])
+    require(await page
+      .locator(`#view option[value="${mode}"]`)
+      .evaluate(
+        (el) => el.disabled,
+      ), "All-source view exposed unrelated file coordinates");
+  const fileSource = await page.evaluate(
+    () => REPORT.runs[0].events.find((e) => e.page !== null)?.source,
+  );
+  if (fileSource) {
+    await page.locator("#kind").selectOption("all");
+    await page
+      .locator("#sources button")
+      .evaluateAll(
+        (buttons, source) =>
+          buttons.find((b) => b.dataset.source === source).click(),
+        fileSource,
+      );
+    for (const mode of ["offset", "delta-file"])
+      require(!(await page
+        .locator(`#view option[value="${mode}"]`)
+        .evaluate(
+          (el) => el.disabled,
+        )), "Selected file did not enable file coordinates");
+    await page.locator("#view").selectOption("delta-file");
+    await page.locator("#allSources").click();
+    require((await page.locator("#view").inputValue()) ===
+      "lanes", "Returning to all sources retained misleading file coordinates");
+    await page.locator("#reset").click();
+  }
   await page.locator("#view").selectOption("address");
   await page.locator("#axis").selectOption("order");
-  const capture = await page.evaluate(() => ({
-    total: REPORT.runs[0].events.length,
-    plotted: REPORT.runs[0].events.filter((e) => e.addressPlot !== false)
-      .length,
-    plottedMajors: REPORT.runs[0].events.filter(
-      (e) => e.major && e.addressPlot !== false,
-    ).length,
-    addressDeltas: REPORT.runs[0].events.filter(
-      (e, i, all) =>
-        i > 0 && e.addressPlot !== false && all[i - 1].addressPlot !== false,
-    ).length,
-    majors: REPORT.runs[0].events.filter((e) => e.major).length,
-    firstMajor: REPORT.runs[0].events.find((e) => e.major)?.id,
-  }));
+  const capture = await page.evaluate(() => {
+    const run = REPORT.runs[0];
+    const visible = run.events.filter(
+      (e) => !run.fileBackedOnly || e.fileBacked,
+    );
+    return {
+      total: REPORT.runs[0].events.length,
+      plotted: visible.filter((e) => e.addressPlot !== false).length,
+      plottedMajors: visible.filter((e) => e.major && e.addressPlot !== false)
+        .length,
+      addressDeltas: visible.filter(
+        (e, i, all) =>
+          i > 0 && e.addressPlot !== false && all[i - 1].addressPlot !== false,
+      ).length,
+      majors: visible.filter((e) => e.major).length,
+      firstMajor: visible.find((e) => e.major)?.order,
+      firstHalf: visible.filter(
+        (e) => e.order <= Math.floor(run.events.length / 2),
+      ).length,
+    };
+  });
   const majorIndices = await page
     .locator("#access")
     .evaluate((el) => el.data.find((t) => t.name === "Major").x);
@@ -45,7 +82,7 @@ async (page) => {
       );
     await page.locator("#useRange").click();
     require((await page.locator("#selectionCount").textContent()).startsWith(
-      end.toLocaleString() + " matching faults",
+      capture.firstHalf.toLocaleString() + " matching faults",
     ), "Plot zoom range did not filter original event indices");
     await page.locator("#clearRange").click();
   }
@@ -57,7 +94,12 @@ async (page) => {
     capture.addressDeltas, "Address deltas must not bridge unplottable events");
   await page.locator("#kind").selectOption("major");
   await page.locator("#tab-stacks").click();
-  await page.locator("#stackLimit").selectOption("50");
+  require((await page
+    .locator("#stackLimit, #stackStart, #stackPrev, #stackNext, #stackReset")
+    .count()) === 0, "Obsolete stack paging/zoom controls remain");
+  require((await page.locator("#stackCount").textContent()).includes(
+    "fully zoomed out",
+  ), "Stack chart does not default to all faults");
   if (capture.majors) {
     await page.locator("#stackScroll").scrollIntoViewIfNeeded();
     await page.locator("#stackScroll").evaluate((el) => {
@@ -73,6 +115,16 @@ async (page) => {
   require((await page.locator("#stacks").getAttribute("aria-label")).includes(
     capture.majors + " matching faults",
   ), "Flame denominator differs from filter");
+  await page.locator("#tab-sites").click();
+  require((await page.locator("#sites [data-fault]").count()) ===
+    capture.majors, "Fault list aggregated or omitted events");
+  if (capture.majors) {
+    await page.locator("#sites [data-fault]").first().click();
+    require((await page.locator("#detail").textContent()).includes(
+      "#" + capture.firstMajor + " ·",
+    ), "Fault list selected the wrong event");
+  }
+  await page.locator("#tab-flame").click();
   await page.locator("#search").fill("__no_such_fault_for_ui_qa__");
   require((await page.locator("#selectionCount").textContent()).startsWith(
     "0 matching faults",
@@ -98,6 +150,6 @@ async (page) => {
     deltaPoints: deltas,
     mobile,
     checks:
-      "counts, stable indices, shared range, deltas, exact selection, flame weights, empty filters, narrow layout",
+      "single-file coordinates, counts, stable indices, shared range, deltas, exact selection, flame weights, empty filters, narrow layout",
   };
 };

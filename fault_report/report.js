@@ -91,13 +91,6 @@ const stackReader = FaultStacks.create({
   scroll: $("stackScroll"),
   tooltip: $("tooltip"),
   onSelect: selectFault,
-  onRange: (start, limit) => {
-    $("stackStart").value = String(start + 1);
-    if (![...$("stackLimit").options].some((o) => Number(o.value) === limit))
-      option($("stackLimit"), limit, fmt(limit) + " faults");
-    $("stackLimit").value = String(limit);
-    drawStacks();
-  },
   onFocus: (label, count) => {
     $("stackCount").textContent = label
       ? "Focused: " + label + " · " + fmt(count) + " faults"
@@ -178,6 +171,7 @@ function update() {
     query = $("search").value.trim().toLowerCase();
   sourceEvents = run.events.filter(
     (e) =>
+      (!run.fileBackedOnly || e.fileBacked) &&
       (kind === "all" || (kind === "major") === e.major) &&
       (!thread || e.thread === thread) &&
       (!section || e.detail.section === section) &&
@@ -193,11 +187,15 @@ function update() {
           .includes(query)),
   );
   events = sourceEvents.filter((e) => !source || e.source === source);
+  syncFileViews();
   $("selectionCount").textContent =
     fmt(events.length) +
     " matching faults / " +
     fmt(run.events.length) +
-    " captured";
+    " captured" +
+    (run.fileBackedOnly
+      ? " · file-backed only; anonymous and unknown mappings hidden"
+      : "");
   $("rangeStatus").textContent = range
     ? (range.field === "time" ? "Time: " : "Recorded index: ") +
       range.lo.toFixed(2) +
@@ -210,11 +208,30 @@ function update() {
     ? sourceNoun() + ": " + sourceInfo(source).path
     : "All " + (run.stacksOnly ? "instruction binaries" : "read sources");
   $("selectedSource").title = $("selectedSource").textContent;
-  $("stackStart").value = "1";
   stackReader.resetFocus();
   if (selected && !events.some((e) => e.id === selected.id)) clearDetail();
   drawSources();
   setTab(activeTab);
+}
+function syncFileViews() {
+  const source = $("source").value;
+  const allowed =
+    !run.stacksOnly &&
+    Boolean(source) &&
+    run.events.some((e) => e.source === source && e.page !== null);
+  for (const [value, label] of [
+    ["offset", "File page index"],
+    ["delta-file", "Δ file page"],
+  ]) {
+    const option = $("view").querySelector(`option[value="${value}"]`);
+    option.disabled = !allowed;
+    option.textContent = label + (allowed ? "" : " (select one file)");
+    option.title = allowed
+      ? ""
+      : "File coordinates require one selected file with known offsets";
+  }
+  if (!allowed && ["offset", "delta-file"].includes($("view").value))
+    $("view").value = "lanes";
 }
 function drawSources() {
   const counts = new Map();
@@ -253,6 +270,7 @@ function drawSources() {
 }
 function drawAccess() {
   if (run.stacksOnly || activeTab !== "pages") return;
+  syncFileViews();
   const mode = $("view").value,
     order = $("axis").value === "order",
     delta = mode.startsWith("delta-");
@@ -337,11 +355,14 @@ function drawAccess() {
       }),
       categoryorder: "array",
       categoryarray: keys.slice().reverse(),
+      range: [-0.5, keys.length - 0.5],
       tickfont: { size: 11 },
       automargin: false,
     };
     l.margin.l = 180;
     l.height = Math.max(420, keys.length * 22 + 100);
+    l.legend.y = 1;
+    l.legend.yanchor = "bottom";
   }
   if (mode === "address" && rows.length) {
     let lo = Infinity,
@@ -439,8 +460,9 @@ function drawAccess() {
     (order
       ? " Indices retain their original positions when minor faults are hidden."
       : "");
-  $("locality").textContent =
-    "Minor includes cache hits, anonymous allocation, and copy-on-write; this view alone cannot measure readahead efficacy.";
+  $("locality").textContent = run.fileBackedOnly
+    ? "File-backed minor faults include cache hits and copy-on-write; counts alone do not measure readahead."
+    : "Minor includes cache hits, anonymous allocation, and copy-on-write; this view alone cannot measure readahead efficacy.";
   if (keys.length === 1) {
     const pages = [
       ...new Set(events.filter((e) => e.page !== null).map((e) => e.page)),
@@ -470,48 +492,28 @@ function drawStacks() {
   if (activeTab !== "stacks" && activeTab !== "flame") return;
   const flame = activeTab === "flame",
     captured = events.filter((e) => e.stack.length).length;
-  for (const id of ["firstControl", "limitControl", "stackPrev", "stackNext"])
-    $(id).hidden = flame;
-  $("stackMode").textContent = flame
-    ? "Aggregated paths · width = fault count"
-    : "Chronological · one column per fault";
   $("stackCoverage").textContent =
     fmt(captured) +
     "/" +
     fmt(events.length) +
-    " faults have captured user stacks. " +
+    " faults have captured stacks. " +
     (flame
-      ? "Root at top. Click a frame to focus. Inspect individual faults in the Stack chart tab."
-      : "Root at top. Click a column to inspect; double-click a frame or Ctrl-wheel to zoom.") +
+      ? "Fault-trigger end at top. Click a frame to focus; Escape shows all paths."
+      : "All matching faults shown. Fault-trigger end at top. Click to inspect; W/S scroll, A/D select adjacent faults.") +
     (!captured && !run.stacksOnly && REPORT.runs.some((r) => r.stacksOnly)
       ? " Choose the DWARF stacks run for the independent stream."
       : "");
-  const start = Math.max(
-    0,
-    Math.min(
-      Math.max(0, events.length - 1),
-      (Number($("stackStart").value) || 1) - 1,
-    ),
-  );
-  const limit = Number($("stackLimit").value);
   $("stackCount").textContent = flame
     ? "All captured paths"
-    : events.length
-      ? "Filtered positions " +
-        (start + 1) +
-        "–" +
-        Math.min(events.length, limit ? start + limit : events.length) +
-        " of " +
-        fmt(events.length)
-      : "No matching faults";
+    : fmt(events.length) + " faults · fully zoomed out";
   stackReader.render({
     events,
     sources: run.sources,
     stacksOnly: Boolean(run.stacksOnly),
     selectedId: selected?.id,
     mode: flame ? "flame" : "chronological",
-    start,
-    limit,
+    start: 0,
+    limit: 0,
   });
 }
 function selectFault(e) {
@@ -521,7 +523,7 @@ function selectFault(e) {
     Fault:
       (e.major ? "Major" : "Minor") +
       " #" +
-      e.id +
+      e.order +
       " · " +
       e.time.toFixed(3) +
       " ms",
@@ -536,6 +538,7 @@ function selectFault(e) {
               : "0x" + Number(e.offset).toString(16),
         }),
     Thread: e.thread,
+    "Capture sequence": e.id,
     ...e.detail,
   };
   $("detail").innerHTML =
@@ -557,12 +560,10 @@ function selectFault(e) {
           "</dd>",
       )
       .join("") +
-    "</dl><h3>Captured stack · root → leaf</h3>" +
+    "</dl><h3>Captured stack · fault-trigger end → callers</h3>" +
     (e.stack.length
       ? '<ol class="stack-list">' +
         e.stack
-          .slice()
-          .reverse()
           .map(
             (f) =>
               '<li title="' +
@@ -579,51 +580,38 @@ function selectFault(e) {
   drawStacks();
 }
 function drawSites() {
-  const groups = new Map();
-  for (const e of events) {
-    if (!e.major) continue;
-    const frame = e.stack[0],
-      label = frame ? frame.label : "No captured stack",
-      key = JSON.stringify([label, frame?.file, e.source]);
-    const group = groups.get(key) || {
-      count: 0,
-      first: e.time,
-      label,
-      source: e.source,
-      file: frame?.file,
-    };
-    group.count++;
-    group.first = Math.min(group.first, e.time);
-    groups.set(key, group);
-  }
   $("sites").innerHTML =
-    [...groups.values()]
-      .sort((a, b) => b.count - a.count || a.first - b.first)
-      .map(
-        (g) =>
-          "<tr><td>" +
-          fmt(g.count) +
+    events
+      .map((e) => {
+        const frame = e.stack.find((f) => !f.kind || f.kind === "user");
+        return (
+          '<tr><td><button data-fault="' +
+          e.id +
+          '">' +
+          fmt(e.order) +
+          "</button></td><td>" +
+          (e.major ? "Major" : "Minor") +
           "</td><td>" +
-          g.first.toFixed(2) +
+          e.time.toFixed(3) +
           '</td><td title="' +
-          escapeHtml(g.file) +
+          escapeHtml(frame?.file) +
           '">' +
-          escapeHtml(g.label) +
+          escapeHtml(frame?.label || "No captured user stack") +
           '</td><td title="' +
-          escapeHtml(sourceInfo(g.source).path) +
+          escapeHtml(sourceInfo(e.source).path) +
           '">' +
-          escapeHtml(sourceLabel(g.source)) +
-          "</td></tr>",
-      )
-      .join("") ||
-    '<tr><td colspan="4">No major faults match the filters.</td></tr>';
+          escapeHtml(sourceLabel(e.source)) +
+          "</td></tr>"
+        );
+      })
+      .join("") || '<tr><td colspan="5">No faults match the filters.</td></tr>';
 }
-function resetStack() {
-  $("stackStart").value = "1";
-  $("stackLimit").value = "0";
-  stackReader.resetFocus();
-  drawStacks();
-}
+$("sites").addEventListener("click", (ev) => {
+  const button = ev.target.closest("[data-fault]");
+  if (!button) return;
+  selectFault(events.find((e) => String(e.id) === button.dataset.fault));
+  $("detail").scrollIntoView({ block: "nearest" });
+});
 $("sources").addEventListener("click", (ev) => {
   const button = ev.target.closest("[data-source]");
   if (!button) return;
@@ -650,28 +638,6 @@ $("view").addEventListener("change", () => {
   drawAccess();
 });
 $("axis").addEventListener("change", drawAccess);
-for (const id of ["stackStart", "stackLimit"])
-  $(id).addEventListener("change", drawStacks);
-$("stackReset").addEventListener("click", resetStack);
-for (const [id, direction] of [
-  ["stackPrev", -1],
-  ["stackNext", 1],
-])
-  $(id).addEventListener("click", () => {
-    const limit = Number($("stackLimit").value) || 100;
-    if (!$("stackLimit").value || $("stackLimit").value === "0")
-      $("stackLimit").value = "100";
-    $("stackStart").value = String(
-      Math.max(
-        1,
-        Math.min(
-          events.length,
-          Number($("stackStart").value) + direction * limit,
-        ),
-      ),
-    );
-    drawStacks();
-  });
 $("reset").addEventListener("click", () => {
   $("kind").value = "major";
   $("source").value = "";

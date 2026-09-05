@@ -272,6 +272,12 @@ th {
   border-top: 1px solid var(--border);
   padding: 10px 13px 20px;
 }
+#panel-sites th:nth-child(-n + 3),
+#panel-sites td:nth-child(-n + 3) {
+  white-space: nowrap;
+  width: 1%;
+  font-variant-numeric: tabular-nums;
+}
 .event-detail h2 {
   margin-bottom: 8px;
 }

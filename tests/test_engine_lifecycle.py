@@ -64,6 +64,8 @@ class StackArtifactTests(unittest.TestCase):
             source.write_bytes(b"source")
             header = root / "cpu_list.h"
             header.write_bytes(b"header")
+            reclaim_header = root / "apk_cache_reclaim.h"
+            reclaim_header.write_bytes(b"reclaim header")
             (root / "page_fault_collector").write_bytes(b"binary")
             with (
                 mock.patch.object(device, "COLLECTOR_SOURCE", source),
@@ -75,6 +77,7 @@ class StackArtifactTests(unittest.TestCase):
                     mock.Mock(), root, "arm64-v8a", 36
                 )
                 header.write_bytes(b"changed header")
+                reclaim_header.write_bytes(b"changed reclaim header")
                 second = device.build_and_push_collector(
                     mock.Mock(), root, "arm64-v8a", 36
                 )
@@ -87,6 +90,10 @@ class StackArtifactTests(unittest.TestCase):
             self.assertNotEqual(
                 first["collector_cpu_list_header_sha256"],
                 second["collector_cpu_list_header_sha256"],
+            )
+            self.assertNotEqual(
+                first["collector_apk_reclaim_header_sha256"],
+                second["collector_apk_reclaim_header_sha256"],
             )
 
 

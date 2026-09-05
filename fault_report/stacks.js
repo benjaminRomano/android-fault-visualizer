@@ -13,9 +13,10 @@
       !!frame.app,
       !!frame.unresolved,
       !!frame.missing,
+      frame.kind || "user",
     ]);
   const stackOf = (event) =>
-    event.stack?.length ? event.stack.slice().reverse() : [missing];
+    event.stack?.length ? event.stack.slice() : [missing];
   const timeOf = (event) => (Number.isFinite(event.time) ? event.time : null);
 
   function buildChronological(events, { start = 0, limit = 0 } = {}) {
@@ -181,7 +182,8 @@
         : frame.app
           ? "#b6d6f1"
           : "#e0e3e6";
-      ctx.fillRect(x, y, Math.max(0, w - 1), ROW - 1);
+      // Thin columns must remain visible when the complete capture is shown.
+      ctx.fillRect(x, y, w > 3 ? w - 1 : w, ROW - 1);
       if (frame.unresolved) {
         ctx.strokeStyle = "#b7c0c9";
         ctx.beginPath();
@@ -263,7 +265,7 @@
         drawNode(focus, 0, 0);
         ctx.fillStyle = "#52616b";
         ctx.fillText(
-          `${focus.count.toLocaleString()} faults · width = fault count · root at top`,
+          `${focus.count.toLocaleString()} faults · width = fault count · fault-trigger end at top`,
           5,
           height - 12,
         );
@@ -315,7 +317,7 @@
       }
       canvas.setAttribute(
         "aria-label",
-        `${state.mode === "flame" ? "Aggregated" : "Chronological"} fault stacks, root at top. Width is fault count, not time. ${state.events.length} matching faults.`,
+        `${state.mode === "flame" ? "Aggregated" : "Chronological"} fault stacks, fault-trigger end at top. Width is fault count, not time. ${state.events.length} matching faults.`,
       );
     }
     function locate(event) {
@@ -397,43 +399,36 @@
         render(state);
       }
     });
-    listen("dblclick", (event) => {
-      if (!state || state.mode === "flame") return;
-      const { hit } = locate(event);
-      if (hit && hit.cell.count < model.events.length)
-        callback("onRange", model.start + hit.cell.start, hit.cell.count);
-    });
-    listen(
-      "wheel",
-      (event) => {
-        if (
-          !state ||
-          state.mode === "flame" ||
-          !event.ctrlKey ||
-          !model.events.length
-        )
-          return;
+    function navigate(event) {
+      if (!state) return;
+      const key = event.key.toLowerCase();
+      if (key === "w" || key === "s") {
         event.preventDefault();
-        const { index } = locate(event),
-          old = model.events.length;
-        const limit = Math.max(
-          1,
-          Math.min(
-            model.total,
-            Math.round(old * (event.deltaY > 0 ? 1.5 : 0.67)),
-          ),
+        scroll.scrollTop += (key === "w" ? -1 : 1) * ROW * 3;
+      } else if (key === "escape") {
+        focusPath = [];
+        render(state);
+      } else if ((key === "a" || key === "d") && state.mode !== "flame") {
+        event.preventDefault();
+        const current = state.events.findIndex(
+          (e) => e.id === state.selectedId,
         );
-        const start = Math.max(
-          0,
-          Math.min(
-            model.total - limit,
-            model.start + index - Math.floor((index / old) * limit),
-          ),
-        );
-        callback("onRange", start, limit);
-      },
-      { passive: false },
-    );
+        const index =
+          current < 0
+            ? key === "a"
+              ? state.events.length - 1
+              : 0
+            : Math.max(
+                0,
+                Math.min(
+                  state.events.length - 1,
+                  current + (key === "a" ? -1 : 1),
+                ),
+              );
+        if (state.events[index]) callback("onSelect", state.events[index]);
+      }
+    }
+    scroll.addEventListener("keydown", navigate);
     return {
       render,
       resetFocus() {
@@ -441,6 +436,7 @@
         callback("onFocus", "", state?.events.length || 0);
       },
       destroy() {
+        scroll.removeEventListener("keydown", navigate);
         listeners.forEach(([type, listener, options]) =>
           canvas.removeEventListener(type, listener, options),
         );

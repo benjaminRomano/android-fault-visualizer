@@ -14,10 +14,10 @@ const frame = (label, file = "/app/main", extra = {}) => ({
   app: true,
   ...extra,
 });
-const event = (id, rootFirst, time = id) => ({
+const event = (id, triggerFirst, time = id) => ({
   id,
   time,
-  stack: rootFirst.slice().reverse(),
+  stack: triggerFirst.slice(),
 });
 
 test("chronological merging keeps every fault column and only merges adjacent full prefixes", () => {
@@ -187,14 +187,36 @@ function fakeSurface() {
   };
   return {
     canvas,
-    scroll: { clientWidth: 600 },
+    scroll: {
+      clientWidth: 600,
+      scrollTop: 0,
+      addEventListener: (type, handler) => handlers.set(type, handler),
+      removeEventListener: (type) => handlers.delete(type),
+    },
     tooltip,
     handlers,
     attributes,
   };
 }
 
-test("canvas selection and range zoom hit the exact column, including merged frames", () => {
+test("captured kernel trigger stays above the faulting user frame and callers", () => {
+  const stack = [
+    { ...frame("fault handler"), kind: "kernel" },
+    { ...frame("faulting instruction"), kind: "user" },
+    { ...frame("caller"), kind: "user" },
+  ];
+  const result = buildChronological([{ id: 1, time: 1, stack }]);
+  assert.deepEqual(
+    result.cells.map((c) => c.frame.label),
+    stack.map((f) => f.label),
+  );
+  assert.equal(
+    buildFlame([{ id: 1, time: 1, stack }]).children[0].frame.kind,
+    "kernel",
+  );
+});
+
+test("canvas selection hits exact columns; keyboard navigation does not zoom", () => {
   const surface = fakeSurface(),
     selections = [],
     ranges = [];
@@ -218,20 +240,20 @@ test("canvas selection and range zoom hit the exact column, including merged fra
   });
   surface.handlers.get("click")({ clientX: 100 + 375, clientY: 200 + 25 });
   assert.deepEqual(selections, [14]);
-  surface.handlers.get("dblclick")({ clientX: 100 + 75, clientY: 200 + 25 });
-  assert.deepEqual(ranges[0], [2, 2]);
+  assert.equal(surface.handlers.has("dblclick"), false);
+  assert.equal(surface.handlers.has("wheel"), false);
   let prevented = false;
-  surface.handlers.get("wheel")({
-    clientX: 100 + 450,
-    clientY: 200 + 25,
-    ctrlKey: true,
-    deltaY: -1,
+  surface.handlers.get("keydown")({
+    key: "s",
     preventDefault() {
       prevented = true;
     },
   });
   assert.equal(prevented, true);
-  assert.deepEqual(ranges[1], [3, 3]);
+  assert.equal(surface.scroll.scrollTop, 60);
+  assert.deepEqual(ranges, []);
+  surface.handlers.get("keydown")({ key: "d", preventDefault() {} });
+  assert.equal(selections.at(-1), 10);
   surface.handlers.get("mousemove")({ clientX: 100 + 375, clientY: 200 + 25 });
   assert.match(surface.tooltip.textContent, /late\n\/app\/main\n/);
   assert.match(
@@ -264,7 +286,7 @@ test("flame focus labels are refreshed on render, not inferred representative se
   assert.deepEqual(focuses.at(-1), ["leaf", 1]);
   renderer.render(state);
   assert.deepEqual(focuses.at(-1), ["leaf", 1]);
-  surface.handlers.get("dblclick")({ clientX: 101, clientY: 201 });
+  assert.equal(surface.handlers.has("dblclick"), false);
   assert.deepEqual(selected, []);
   renderer.resetFocus();
   renderer.render(state);

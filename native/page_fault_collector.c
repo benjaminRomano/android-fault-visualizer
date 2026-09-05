@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "cpu_list.h"
+#include "apk_cache_reclaim.h"
 
 #define RING_DATA_PAGES 256
 #define MAX_SAMPLES 500000
@@ -316,8 +317,9 @@ static void usage(const char *program) {
           "Usage: %s --output FILE --mappings-output FILE "
           "[--callchains-output FILE] [--duration-ms N]\n"
           "       %s --residency FILE [FILE ...]\n"
-          "       %s --evict FILE [FILE ...]\n",
-          program, program, program);
+          "       %s --evict FILE [FILE ...]\n"
+          "       %s --reclaim-mapped-apks APK [APK ...]\n",
+          program, program, program, program);
 }
 
 static int read_online_cpus(int **cpus_out, size_t *count_out,
@@ -453,6 +455,9 @@ static int report_residency(int file_count, char **paths) {
 }
 
 int main(int argc, char **argv) {
+  if (argc >= 3 && strcmp(argv[1], "--reclaim-mapped-apks") == 0) {
+    return reclaim_mapped_apks(argc - 2, argv + 2);
+  }
   if (argc >= 3 && strcmp(argv[1], "--residency") == 0) {
     return report_residency(argc - 2, argv + 2);
   }

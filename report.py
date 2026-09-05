@@ -59,19 +59,21 @@ def report_run(path: Path, label: str | None = None) -> dict:
         raise ValueError("Fault CSV count differs from capture metadata")
     chains = defaultdict(list)
     for row in read_csv(path / "resolved_fault_callchains.csv"):
-        if row["frame_kind"] != "user":
-            continue
         chains[int(row["sequence"])].append(
             (
                 int(row["frame_index"]),
                 {
                     "label": row["label"],
+                    "kind": row["frame_kind"],
                     "file": row["file_name"],
                     "app": is_app_owned_path(row["file_name"], package),
                     "unresolved": not row["file_name"] or row["label"].startswith("0x"),
                 },
             )
         )
+    from android_fault_visualizer.simpleperf import exact_dwarf_matches
+
+    dwarf = exact_dwarf_matches(path, metadata)
     detail_path = path / "fault_details.json"
     details = (
         {int(r["sequence"]): r for r in json.loads(detail_path.read_text())}
@@ -97,6 +99,11 @@ def report_run(path: Path, label: str | None = None) -> dict:
         )
         offset = int(row["offset"]) if row["offset"] else None
         detail = details.get(seq, {})
+        stack = [f for _, f in sorted(chains[seq], key=lambda pair: pair[0])]
+        matched = dwarf["matches"].get(seq)
+        if matched:
+            # Keep actual kernel frames; use only identity-verified user unwinding.
+            stack = [f for f in stack if f["kind"] == "kernel"] + matched["stack"]
         events.append(
             {
                 "id": seq,
@@ -104,11 +111,17 @@ def report_run(path: Path, label: str | None = None) -> dict:
                 "major": row["event_type"] == "major",
                 "address": hex(int(row["address"])),
                 "source": source,
+                "fileBacked": row.get("mapping_kind") == "file",
                 "page": offset // page_size if offset is not None else None,
                 "offset": offset,
                 "thread": f"{row.get('thread_name') or 'unnamed'} ({row['tid']})",
-                "stack": [f for _, f in sorted(chains[seq], key=lambda pair: pair[0])],
+                "stack": stack,
                 "detail": {
+                    **(
+                        {"Stack evidence": json.dumps(matched["provenance"])}
+                        if matched
+                        else {}
+                    ),
                     "section": detail.get("section", ""),
                     "dex": detail.get("dex") or row.get("zip_entry_name", ""),
                     "DEX methods on this page (content, not callers)": "; ".join(
@@ -146,11 +159,22 @@ def report_run(path: Path, label: str | None = None) -> dict:
         "Cache insertions include app threads and workers touching exact app-owned device/inode pairs. They correlate with reads/readahead; they do not establish which fault caused an insertion.",
         "Code-layout changes need repeated, equally prepared captures of the same startup. R8 DEX order and ART-compiled OAT layout are different layers.",
         *metadata.get("warnings", []),
+        *dwarf["warnings"],
     ]
+    if dwarf["coverage"]:
+        coverage = dwarf["coverage"]
+        notes.append(
+            f"DWARF stacks matched to {coverage['matched_startup_major_faults']} / "
+            f"{coverage['startup_major_faults']} major faults using exact PID, TID, "
+            "boottime timestamp, instruction address and CPU. Ambiguous or unmatched "
+            "events retain their native stack; no nearest-time matching is used."
+        )
+        metadata["report_dwarf_enrichment"] = coverage
     return {
         "label": label or path.name,
         "subtitle": f"Android {metadata.get('release','')} · {package} · PID {metadata.get('pid')} · startup {metadata.get('startup',{}).get('duration_ns',0)/1e6:.1f} ms",
         "pageSize": page_size,
+        "fileBackedOnly": True,
         "events": events,
         "sources": sources,
         "cache": cache_text,

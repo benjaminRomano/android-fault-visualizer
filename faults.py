@@ -30,6 +30,7 @@ from android_fault_visualizer.device import (
     record_cache_gate,
     stop_and_enumerate_cache_targets,
     drop_caches,
+    reclaim_mapped_apks,
     resolve_activity,
     dump_process_state,
     dump_inode_mapping,
@@ -58,6 +59,7 @@ def collect(
     rebooted_before_collect: bool,
     capture_stacks: bool,
     dwarf_stacks: bool = False,
+    reclaim_apk_mappings: bool = False,
 ) -> None:
     adb.ensure_root()
     sdk = int(adb.getprop("ro.build.version.sdk"))
@@ -92,12 +94,14 @@ def collect(
             check=True,
         ).stdout.strip(),
         "collector": "perf-software-page-fault-events",
+        "collector_clock": "boottime",
         "collector_version": 5,
         "capture_native_callchains": capture_stacks,
         "cache_procedure": (
             "force-stop-wait+stable-target-set+sync+drop_caches+fadvise+mincore-v3"
         ),
         "cache_max_resident_pages": max_resident_pages,
+        "reclaim_mapped_apks": reclaim_apk_mappings,
         "reboot_before_collect": rebooted_before_collect,
         "boot_id": adb.shell(
             ["cat", "/proc/sys/kernel/random/boot_id"],
@@ -119,6 +123,11 @@ def collect(
     }
     capture_warnings: list[str] = []
     metadata["warnings"] = capture_warnings
+    if reclaim_apk_mappings:
+        metadata["cache_procedure"] = metadata["cache_procedure"].replace(
+            "+mincore-v3", "+exact-read-only-APK-MADV_PAGEOUT+fadvise+mincore-v4"
+        )
+        metadata["mapped_apk_reclaim"] = []
     write_capture_metadata(output_dir, metadata)
 
     targets = stop_and_enumerate_cache_targets(adb, package, apk_paths)
@@ -137,6 +146,12 @@ def collect(
     write_residency(output_dir, residency_rows)
 
     drop_caches(adb, sdk, targets)
+    if reclaim_apk_mappings:
+        diagnostics = reclaim_mapped_apks(adb, apk_paths, output_dir, "after_drop")
+        metadata["mapped_apk_reclaim"].append(diagnostics)
+        if diagnostics.get("warning"):
+            capture_warnings.append(diagnostics["warning"])
+        write_capture_metadata(output_dir, metadata)
     residency_rows.extend(
         parse_residency(
             run_collector_file_command(adb, "--residency", targets),
@@ -206,6 +221,15 @@ def collect(
             )
             run_collector_file_command(adb, "--evict", added_targets)
         targets = current_targets
+
+        if reclaim_apk_mappings:
+            diagnostics = reclaim_mapped_apks(
+                adb, apk_paths, output_dir, "before_launch"
+            )
+            metadata["mapped_apk_reclaim"].append(diagnostics)
+            if diagnostics.get("warning"):
+                capture_warnings.append(diagnostics["warning"])
+            write_capture_metadata(output_dir, metadata)
 
         residency_rows.extend(
             parse_residency(
@@ -439,6 +463,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reclaim-mapped-apks",
+        action="store_true",
+        help=(
+            "Also request reclaim of exact installed APK read-only mappings in other "
+            "processes (root, Linux 5.10+). Shared/pinned pages can remain; the "
+            "same strict mincore gate still applies."
+        ),
+    )
+    parser.add_argument(
         "--reboot-before-collect",
         action="store_true",
         help="Reboot the adb target and wait for boot completion before collection",
@@ -487,6 +520,7 @@ def main() -> None:
             args.reboot_before_collect,
             args.capture_stacks,
             args.dwarf_stacks,
+            args.reclaim_mapped_apks,
         )
     process_capture(output_dir)
     from report import build_report

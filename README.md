@@ -39,11 +39,15 @@ uv run faults.py --package com.example.app --serial emulator-5554 \
 
 This starts system-wide Simpleperf **before** launch and waits for its recording
 notification. It exports only the launched PID and startup window, with stack
-joining and timestamp-gap removal disabled. Choose the “DWARF stacks” run in
-the HTML. It is a separate stream: the tested Simpleperf does not sample the
-faulted address, so its stacks are never guessed onto exact events by timestamp
-or ordinal. Running two profilers adds substantial overhead and can reduce
-native stack coverage; compare only equivalently instrumented captures.
+joining and timestamp-gap removal disabled. For newly bound captures, the report
+can attach a DWARF stack to an exact native fault only when PID, TID, nanosecond
+boottime timestamp, instruction address and CPU all match uniquely. Recorder
+identity, same-boot metadata, artifact hashes, period and loss checks must also
+pass. Ambiguous matches and legacy captures remain separate; there is no
+nearest-time or ordinal matching. The independent “DWARF stacks” run remains
+available. Simpleperf supplies the user stack; the native event still supplies
+the fault address and file mapping. Two profilers add overhead and can affect
+native callchain capture; compare only equivalently instrumented runs.
 
 ## Cache verification
 
@@ -60,6 +64,10 @@ System/framework file residency is outside this app-file check.
 
 Use `--reboot-before-collect` for isolated iterations if other processes retain
 APK pages. Rebooting does not bypass the residency gate.
+On supported rooted kernels, `--reclaim-mapped-apks` also attempts bounded
+page-out of read-only mappings of the installed APKs in other processes. It
+does not stop those processes or reclaim unrelated memory. This is opt-in;
+multiply mapped pages may remain resident and still fail the strict gate.
 `--max-resident-pages N` explicitly allows a partially warm experiment.
 A post-launch residency failure preserves the usable capture with a warning.
 
@@ -69,7 +77,9 @@ The report defaults to **major faults**, ordered by major count.
 
 - The source sidebar shows filtered counts, major-first; hover retains full paths.
   Click a source to filter the analysis panes.
-- File lanes, whole-file page indices, and virtual-address plots share filters.
+- File lanes and virtual-address plots work across all sources. File-page indices
+  and file-page deltas require one explicitly selected file; unrelated file
+  coordinates are never overlaid. Returning to All switches these views to Files.
 - VDEX remains one file, including shared/verification data. Verified DEX starts
   are red lines. Android 10 VDEX 021/002 and modern VDEX 027 are supported.
 - DEX names require the complete ART location-checksum list to match APK ZIP
@@ -78,11 +88,16 @@ The report defaults to **major faults**, ordered by major count.
   That is not proof those classes executed or triggered a fault. CompactDex and
   compressed DEX method ranges are not decoded.
 - Native ELF sections and verified DEX identity are retained in point details.
-- Stack roots are at the top, faulting frames below. One chronological column
-  is one fault, not a duration. Click a column for the exact event and stack.
+- Android views show file-backed faults; anonymous and unknown mappings remain
+  in the raw capture but are hidden from the reader.
+- Stacks show the captured fault-trigger end at the top, including kernel frames
+  when recorded. All matching faults are shown by default. Click a column for
+  its exact stack; W/S scroll vertically and A/D select adjacent faults.
 - Stack chart and Flame graph are separate tabs: the former preserves time
   order, the latter aggregates complete call paths by fault count. Click a
-  flame frame to focus it; reset restores the full graph. Neither width is time.
+  flame frame to focus it; Escape restores the full graph. Neither width is time.
+- The Fault list preserves individual faults in capture order, with their read
+  source and a link to the complete stack. It does not group by symbol.
 - Address plots support elapsed time or original recorded fault index. Hiding
   minor faults does not renumber major points. Signed virtual-page and file-page
   delta views compare consecutive filtered faults; file deltas omit cross-file

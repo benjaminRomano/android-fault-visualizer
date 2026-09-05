@@ -99,19 +99,39 @@ class Adb:
         ).stdout.strip()
 
     def reboot_and_wait(self, timeout_seconds: int = 180) -> None:
-        self.run(["reboot"], check=True)
-        self.run(["wait-for-device"], check=True)
+        boot_id_command = ["cat", "/proc/sys/kernel/random/boot_id"]
+        previous_boot = self.shell(
+            boot_id_command, capture_output=True, text=True, check=True, timeout=5
+        ).stdout.strip()
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", previous_boot):
+            raise RuntimeError("Unable to establish the current Android boot identity")
         deadline = time.monotonic() + timeout_seconds
+        self.run(["reboot"], check=True, timeout=min(15, timeout_seconds))
+        self._root_template = None
         while time.monotonic() < deadline:
-            result = self.shell(
-                ["getprop", "sys.boot_completed"],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0 and result.stdout.strip() == "1":
-                return
+            try:
+                current_boot = self.shell(
+                    boot_id_command, capture_output=True, text=True, timeout=5
+                )
+                # ADB can reconnect before the reboot has actually begun. The
+                # old boot_completed=1 must not satisfy readiness for this boot.
+                if (
+                    current_boot.returncode == 0
+                    and re.fullmatch(r"[0-9a-fA-F-]{36}", current_boot.stdout.strip())
+                    and current_boot.stdout.strip() != previous_boot
+                ):
+                    result = self.shell(
+                        ["getprop", "sys.boot_completed"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0 and result.stdout.strip() == "1":
+                        return
+            except subprocess.TimeoutExpired:
+                pass  # The transport is expected to disappear during reboot.
             time.sleep(1)
-        raise RuntimeError("Timed out waiting for Android to finish rebooting")
+        raise RuntimeError("Timed out waiting for a new Android boot to complete")
 
     def pull_with_root_fallback(self, remote: str, local: Path) -> None:
         result = self.run(
@@ -240,6 +260,9 @@ def build_and_push_collector(
         ).hexdigest(),
         "collector_cpu_list_header_sha256": hashlib.sha256(
             COLLECTOR_SOURCE.with_name("cpu_list.h").read_bytes()
+        ).hexdigest(),
+        "collector_apk_reclaim_header_sha256": hashlib.sha256(
+            COLLECTOR_SOURCE.with_name("apk_cache_reclaim.h").read_bytes()
         ).hexdigest(),
         "collector_binary_sha256": hashlib.sha256(
             local_binary.read_bytes()
@@ -534,6 +557,137 @@ def drop_caches(adb: Adb, sdk: int, files: list[str]) -> None:
 
     # This is file-scoped and harmless if global reclaim already evicted a page.
     run_collector_file_command(adb, "--evict", files)
+
+
+APK_RECLAIM_FIELDS = (
+    "pid",
+    "starttime",
+    "begin",
+    "end",
+    "offset",
+    "dev",
+    "inode",
+    "permissions",
+    "requested",
+    "result",
+    "errno",
+    "path",
+)
+
+
+def parse_apk_reclaim_output(
+    stdout: str, apk_paths: list[str]
+) -> list[dict[str, object]]:
+    reader = csv.DictReader(io.StringIO(stdout), delimiter="\t")
+    if reader.fieldnames != list(APK_RECLAIM_FIELDS):
+        raise RuntimeError("Invalid mapped APK reclaim audit header")
+    rows = []
+    for row in reader:
+        if set(row) != set(APK_RECLAIM_FIELDS) or any(
+            value is None for value in row.values()
+        ):
+            raise RuntimeError("Malformed mapped APK reclaim audit row")
+        try:
+            numeric = {
+                key: int(row[key])
+                for key in ("pid", "starttime", "inode", "requested", "result", "errno")
+            }
+            addresses = {key: int(row[key], 16) for key in ("begin", "end", "offset")}
+        except ValueError as error:
+            raise RuntimeError("Invalid mapped APK reclaim audit number") from error
+        if (
+            row["path"] not in apk_paths
+            or row["permissions"] not in ("r--s", "r--p")
+            or not re.fullmatch(r"[0-9a-f]+:[0-9a-f]+", row["dev"])
+            or numeric["pid"] <= 1
+            or numeric["starttime"] <= 0
+            or numeric["inode"] <= 0
+            or addresses["begin"] <= 0
+            or addresses["offset"] < 0
+            or addresses["end"] - addresses["begin"] != numeric["requested"]
+            or not 0 < numeric["requested"] <= 256 * 1024 * 1024
+            or numeric["result"] < -1
+            or numeric["result"] > numeric["requested"]
+            or numeric["errno"] < 0
+            or (numeric["result"] == -1) != (numeric["errno"] > 0)
+        ):
+            raise RuntimeError(
+                "Out-of-scope or inconsistent mapped APK reclaim audit row"
+            )
+        rows.append({**row, **numeric, **addresses})
+    if len(rows) > 256 or sum(row["requested"] for row in rows) > 1024 * 1024 * 1024:
+        raise RuntimeError("Mapped APK reclaim audit exceeds bounded scope")
+    return rows
+
+
+def reclaim_mapped_apks(
+    adb: Adb, apk_paths: list[str], output_dir: Path, phase: str
+) -> dict[str, object]:
+    """Opt-in, file-scoped MADV_PAGEOUT. Advice success never proves eviction.
+
+    apk_paths must come from pm path for the target package. The native helper
+    validates the exact regular-file device/inode and read-only mapping before
+    each call, retaining PID start identity and byte ranges for the audit.
+    """
+    if phase not in ("after_drop", "before_launch"):
+        raise ValueError(f"Invalid APK reclaim phase: {phase}")
+    if (
+        not apk_paths
+        or len(apk_paths) > 128
+        or len(set(apk_paths)) != len(apk_paths)
+        or any(
+            not path.startswith("/data/app/")
+            or not path.endswith(".apk")
+            or ".." in Path(path).parts
+            or any(character in path for character in "\n\r\t")
+            for path in apk_paths
+        )
+    ):
+        raise ValueError("Mapped reclaim requires exact installed /data/app APK paths")
+    command = shlex.join([REMOTE_COLLECTOR, "--reclaim-mapped-apks", *apk_paths])
+    try:
+        result = adb.root_shell(command, capture_output=True, text=True, timeout=15)
+        stdout, stderr, return_code = result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout or ""
+        stderr = error.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        stderr += "\nMapped APK reclaim exceeded the 15-second host timeout"
+        return_code = None
+    artifact = f"mapped-apk-reclaim-{phase}.tsv"
+    (output_dir / artifact).write_text(stdout)
+    (output_dir / f"mapped-apk-reclaim-{phase}.stderr.txt").write_text(stderr)
+    if not stdout and return_code == 0:
+        raise RuntimeError(
+            "Mapped APK reclaim completed without its required audit header"
+        )
+    rows = parse_apk_reclaim_output(stdout, apk_paths) if stdout else []
+    diagnostics: dict[str, object] = {
+        "phase": phase,
+        "method": "process_madvise(MADV_PAGEOUT) on exact read-only installed APK mappings",
+        "command": command,
+        "return_code": return_code,
+        "audit_file": artifact,
+        "stderr": stderr.strip(),
+        "ranges_attempted": len(rows),
+        "requested_bytes": sum(row["requested"] for row in rows),
+        "advised_bytes": sum(max(0, row["result"]) for row in rows),
+        "failed_ranges": sum(row["result"] != row["requested"] for row in rows),
+        "eviction_verified": False,  # Only the subsequent mincore gate proves this.
+    }
+    if return_code != 0 or diagnostics["failed_ranges"]:
+        diagnostics["warning"] = (
+            f"Mapped APK reclaim was incomplete (exit={return_code}, "
+            f"failed ranges={diagnostics['failed_ranges']}). "
+            "The normal strict residency check remains authoritative."
+        )
+    # MADV_PAGEOUT can leave unmapped/readahead cache pages. This final file-only
+    # hint removes eligible leftovers without touching bytes or other mappings.
+    run_collector_file_command(adb, "--evict", apk_paths)
+    return diagnostics
 
 
 def resolve_activity(adb: Adb, package: str, requested: Optional[str]) -> str:
